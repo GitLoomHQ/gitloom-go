@@ -76,4 +76,4 @@ returns.
 
 ## Docs
 
-https://gitloom.cloud/docs/sdk-go.html
+https://docs.gitloom.cloud/documentation/go
