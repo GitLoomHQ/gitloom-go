@@ -43,8 +43,11 @@ func (conv *Conversation) Context(ctx context.Context, userMessage string) (stri
 // GitLoom receives the turns for ingestion, so the flattened detail stays
 // recallable.
 func (conv *Conversation) Compact(ctx context.Context) (string, error) {
+	if conv.opts.Summarize == nil && conv.opts.SummarizeServer {
+		return conv.compactOnServer(ctx)
+	}
 	if conv.opts.Summarize == nil {
-		return "", fmt.Errorf("gitloom: compaction needs a Summarize option; without one the evicted turns would be dropped")
+		return "", fmt.Errorf("gitloom: compaction needs a Summarize option or SummarizeServer; without one the evicted turns would be dropped")
 	}
 	evicted := conv.evictable()
 	if len(evicted) == 0 {
@@ -83,6 +86,45 @@ func (conv *Conversation) Compact(ctx context.Context) (string, error) {
 	conv.exchanges = 0
 	conv.reportedTokens = 0
 	return summary, nil
+}
+
+// compactOnServer asks GitLoom's own model to write the summary from the
+// stored turns — the developer's choice against local summarization. The turns
+// are already stored server-side, so summarizing them there adds no exposure;
+// it costs one chat from the account's meter.
+func (conv *Conversation) compactOnServer(ctx context.Context) (string, error) {
+	evicted := conv.evictable()
+	if len(evicted) == 0 {
+		if len(conv.history) < 2 {
+			return "", nil
+		}
+		keep := 2
+		if len(conv.history) <= keep {
+			keep = len(conv.history) - 1
+		}
+		evicted = conv.history[:len(conv.history)-keep]
+	}
+	from := conv.firstLiveSeq
+	to := from + int64(len(evicted)) - 1
+	var res struct {
+		Summary string `json:"summary"`
+	}
+	err := conv.client.request(ctx, "POST",
+		"/v1/conversations/"+url.PathEscape(conv.ID)+"/compact",
+		map[string]any{"branch": conv.Branch, "auto": true, "from_seq": from, "to_seq": to}, &res)
+	if err != nil {
+		return "", err
+	}
+	if conv.summary != "" {
+		conv.summary = conv.summary + "\n\nThen: " + res.Summary
+	} else {
+		conv.summary = res.Summary
+	}
+	conv.history = conv.history[len(evicted):]
+	conv.firstLiveSeq = to + 1
+	conv.exchanges = 0
+	conv.reportedTokens = 0
+	return res.Summary, nil
 }
 
 // fitted returns the live turns that fit the window, oldest evicted first.

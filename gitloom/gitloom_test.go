@@ -70,7 +70,7 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 		send(map[string]any{"next_seq": f.nextSeq, "written": len(msgs)})
 	case strings.HasSuffix(p, "/compact"):
 		f.compactions = append(f.compactions, body)
-		send(map[string]any{"compacted": true})
+		send(map[string]any{"compacted": true, "summary": "server summary"})
 	case strings.HasSuffix(p, "/edit"):
 		seq := int64(body["seq"].(float64))
 		name := fmt.Sprintf("main-%d", seq)
@@ -271,5 +271,89 @@ func TestAPIErrorBothShapes(t *testing.T) {
 		if e.Code != tc.wantCode || e.Message != tc.wantMsg {
 			t.Fatalf("%s -> %+v", tc.body, e)
 		}
+	}
+}
+
+// The drop-in: karma's own signature, ChatId selects the conversation, only
+// new messages are passed, and the wrapper supplies the remembered window.
+func TestWrapKarmaIsADropIn(t *testing.T) {
+	api, client := newFakeAPI(t)
+	ai := &fakeCompleter{reply: "the reply", tokens: 50}
+	kai := WrapKarma(ai, client, ConversationOptions{Model: "gpt-4o"})
+
+	_, err := kai.ChatCompletion(models.AIChatHistory{
+		ChatId:   "conv-1",
+		Messages: []models.AIMessage{{Role: models.User, Message: "I like Go"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(api.messages) != 2 {
+		t.Fatalf("both turns should be stored, got %d", len(api.messages))
+	}
+
+	_, err = kai.ChatCompletion(models.AIChatHistory{
+		ChatId:   "conv-1",
+		Messages: []models.AIMessage{{Role: models.User, Message: "what do I like?"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The second completion carried the first exchange without the caller
+	// passing it.
+	second := ai.calls[1]
+	var texts []string
+	for _, m := range second.Messages {
+		texts = append(texts, string(m.Role)+":"+m.Message)
+	}
+	joined := strings.Join(texts, "|")
+	if !strings.Contains(joined, "user:I like Go") || !strings.Contains(joined, "assistant:the reply") {
+		t.Fatalf("window not supplied by the wrapper: %s", joined)
+	}
+	// Memory context reached the model as background.
+	if !strings.Contains(second.Context, "prefers Go") {
+		t.Fatalf("memory context missing: %q", second.Context)
+	}
+}
+
+// No ChatId means no management: the wrapper is invisible.
+func TestWrapKarmaPassesPlainCallsThrough(t *testing.T) {
+	api, client := newFakeAPI(t)
+	ai := &fakeCompleter{reply: "r", tokens: 1}
+	kai := WrapKarma(ai, client, ConversationOptions{Model: "gpt-4o"})
+	if _, err := kai.ChatCompletion(models.AIChatHistory{
+		Messages: []models.AIMessage{{Role: models.User, Message: "x"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.messages) != 0 {
+		t.Fatal("a plain call must store nothing")
+	}
+}
+
+// Server-side compaction: the summary comes back from GitLoom's model.
+func TestServerSideCompaction(t *testing.T) {
+	api, client := newFakeAPI(t)
+	conv, err := client.NewConversation(t.Context(), "c1", ConversationOptions{
+		Model: "claude-sonnet-5", CompactEvery: 1, SummarizeServer: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := conv.Append(t.Context(), []models.AIMessage{
+			{Role: models.User, Message: "q"}, {Role: models.Assistant, Message: "a"},
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(api.compactions) == 0 {
+		t.Fatal("server compaction never asked the server")
+	}
+	if _, hasSummary := api.compactions[0]["summary"]; hasSummary {
+		t.Fatal("auto compaction must not send a client summary")
+	}
+	if api.compactions[0]["auto"] != true {
+		t.Fatalf("auto flag missing: %+v", api.compactions[0])
 	}
 }

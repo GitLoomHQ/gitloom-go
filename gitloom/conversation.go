@@ -43,9 +43,13 @@ type ConversationOptions struct {
 	// trigger, so a huge window must not mean hours before anything is
 	// remembered.
 	CompactEvery int
-	// Summarize produces the compaction summary, typically via the caller's
-	// own KarmaAI — GitLoom never sees the conversation to compact it.
+	// Summarize produces the compaction summary locally, typically via the
+	// caller's own KarmaAI — GitLoom never sees the conversation to compact it.
 	Summarize Summarizer
+	// SummarizeServer hands summarization to GitLoom's own model instead: the
+	// turns are already stored there, and the client needs no model wired in.
+	// Used when Summarize is nil. Costs one chat from the account's meter.
+	SummarizeServer bool
 	// Namespace memories land in and are recalled from.
 	Namespace string
 	// Memory selects how retrieval happens. Default MemoryQuery.
@@ -187,7 +191,7 @@ func (conv *Conversation) Append(ctx context.Context, msgs []models.AIMessage, r
 			conv.exchanges++
 		}
 	}
-	if conv.opts.Summarize != nil && (conv.wouldOverflow(msgs) || conv.cadenceDue()) {
+	if (conv.opts.Summarize != nil || conv.opts.SummarizeServer) && (conv.wouldOverflow(msgs) || conv.cadenceDue()) {
 		if _, err := conv.Compact(ctx); err != nil {
 			return err
 		}

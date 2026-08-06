@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/MelloB1989/karma/models"
 )
@@ -73,6 +74,99 @@ func (ch *Chat) SayMessage(ctx context.Context, msg models.AIMessage) (*models.A
 		return resp, fmt.Errorf("gitloom: reply produced but not stored: %w", err)
 	}
 	return resp, nil
+}
+
+// WrapKarma is the drop-in: it has karma's own ChatCompletion signature, so a
+// caller switches from *ai.KarmaAI to this and changes nothing else. A history
+// whose ChatId is set becomes a managed conversation — pass only the NEW
+// messages; the stored conversation supplies the remembered window, memory
+// supplies the context, and both turns are stored with the response's real
+// token count. A history with no ChatId passes straight through.
+type WrappedKarma struct {
+	ai     Completer
+	client *Client
+	opts   ConversationOptions
+	mu     sync.Mutex
+	convs  map[string]*Conversation
+}
+
+// WrapKarma wraps a karma completer. opts configure the conversations the
+// wrapper opens; Model is taken per call from karma's configuration when
+// empty.
+func WrapKarma(ai Completer, client *Client, opts ConversationOptions) *WrappedKarma {
+	if opts.Summarize == nil && !opts.SummarizeServer {
+		opts.Summarize = KarmaSummarizer(ai)
+	}
+	return &WrappedKarma{ai: ai, client: client, opts: opts, convs: map[string]*Conversation{}}
+}
+
+// ChatCompletion mirrors karma's. ChatId selects the managed conversation.
+func (w *WrappedKarma) ChatCompletion(h models.AIChatHistory) (*models.AIChatResponse, error) {
+	if h.ChatId == "" {
+		return w.ai.ChatCompletion(h)
+	}
+	ctx := context.Background()
+	conv, err := w.conversation(ctx, h.ChatId)
+	if err != nil {
+		return nil, err
+	}
+
+	fresh := h.Messages
+	var lastUser string
+	for i := len(fresh) - 1; i >= 0; i-- {
+		if fresh[i].Role == models.User {
+			lastUser = fresh[i].Message
+			break
+		}
+	}
+	memoryCtx, err := conv.Context(ctx, lastUser)
+	if err != nil {
+		memoryCtx = "" // retrieval failing must not fail the completion
+	}
+
+	out := conv.History(h.SystemMsg)
+	if h.Title != "" {
+		out.Title = h.Title
+	}
+	if memoryCtx != "" {
+		if out.Context != "" {
+			out.Context += "\n\n" + memoryCtx
+		} else {
+			out.Context = memoryCtx
+		}
+	}
+	if h.Context != "" {
+		out.Context = strings.TrimSpace(out.Context + "\n\n" + h.Context)
+	}
+	out.Messages = append(out.Messages, fresh...)
+
+	resp, err := w.ai.ChatCompletion(out)
+	if err != nil {
+		return nil, err
+	}
+	stored := append([]models.AIMessage{}, fresh...)
+	stored = append(stored, models.AIMessage{Role: models.Assistant, Message: resp.AIResponse})
+	if err := conv.Append(ctx, stored, resp); err != nil {
+		return resp, fmt.Errorf("gitloom: reply produced but not stored: %w", err)
+	}
+	return resp, nil
+}
+
+func (w *WrappedKarma) conversation(ctx context.Context, id string) (*Conversation, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if c, ok := w.convs[id]; ok {
+		return c, nil
+	}
+	c, err := w.client.NewConversation(ctx, id, w.opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.Load(ctx, LoadOptions{}); err != nil {
+		return nil, err
+	}
+	w.convs[id] = c
+	return c, nil
 }
 
 // KarmaSummarizer compacts with the caller's own karma model.
