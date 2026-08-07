@@ -172,3 +172,18 @@ func contains(hay, needle string) bool {
 	}
 	return false
 }
+
+func TestRecallCanDropProvenance(t *testing.T) {
+	r, c := newRecorder(t, map[string]any{"hits": []any{}})
+	// Provenance is a git-log walk per hit and dominates the request once a
+	// memory has history; a latency-sensitive caller has to be able to say no.
+	if _, err := c.Recall(context.Background(), "anything", &RecallOptions{NoProvenance: true}); err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if !contains(r.query, "no_provenance=1") {
+		t.Errorf("query %q did not carry the opt-out", r.query)
+	}
+	if contains(r.query, "no_relations") {
+		t.Error("relations were dropped without being asked to be")
+	}
+}

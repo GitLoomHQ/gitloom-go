@@ -105,6 +105,15 @@ func (c *Client) Remember(ctx context.Context, turns []Turn, opts *RememberOptio
 type RecallOptions struct {
 	Namespace string
 	Limit     int
+	// NoProvenance drops each hit's git history (commit, author, revisions,
+	// diff). On by default because a hosted answer should be citable — but it
+	// costs a git-log walk PER HIT, which dominates the request once a memory
+	// has real history behind it. Turn it off for anything latency-sensitive
+	// that is not going to show a citation.
+	NoProvenance bool
+	// NoRelations drops each hit's neighbours and their snippets. Cheap to
+	// leave on; this exists for bulk scans that only want the text.
+	NoRelations bool
 }
 
 // Recall retrieves what is known that bears on the query.
@@ -119,6 +128,12 @@ func (c *Client) Recall(ctx context.Context, query string, opts *RecallOptions) 
 	q := url.Values{"q": {query}, "namespace": {o.Namespace}}
 	if o.Limit > 0 {
 		q.Set("limit", strconv.Itoa(o.Limit))
+	}
+	if o.NoProvenance {
+		q.Set("no_provenance", "1")
+	}
+	if o.NoRelations {
+		q.Set("no_relations", "1")
 	}
 	var out RecallResult
 	if err := c.request(ctx, "GET", "/v1/retrieve?"+q.Encode(), nil, &out); err != nil {
