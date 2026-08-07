@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.0 — 2026-08-08
+
+- **Streaming drop-in.** ChatCompletionStream mirrors karma's — chunks pass
+  through your callback, the managed conversation stores the exchange at the
+  end.
+- **Added features on the wrapper.** kai.Conversation(ctx, chatID) exposes
+  rewind/edit/redaction/titles/branches on the same managed conversation the
+  completions flow through; kai.Memory() for direct recall/remember.
+- Documentation leads with the drop-in only; the manual loop is gone.
+
 ## v0.2.0 — 2026-08-08
 
 - **Drop-in mode.** `gitloom.WrapKarma(kai, client, opts)` has karma's own

@@ -188,3 +188,71 @@ func KarmaSummarizer(ai Completer) Summarizer {
 		return resp.AIResponse, nil
 	}
 }
+
+// StreamCompleter is the streaming slice of karma's KarmaAI.
+type StreamCompleter interface {
+	ChatCompletionStream(messages models.AIChatHistory, callback func(chunk models.StreamedResponse) error) (*models.AIChatResponse, error)
+}
+
+// ChatCompletionStream mirrors karma's streaming call. Chunks pass through the
+// callback untouched; the managed conversation stores the finished exchange
+// afterwards, exactly as the non-streaming path does. The wrapped completer
+// must implement StreamCompleter (KarmaAI does); anything else errors rather
+// than silently degrading to non-streaming.
+func (w *WrappedKarma) ChatCompletionStream(h models.AIChatHistory, callback func(chunk models.StreamedResponse) error) (*models.AIChatResponse, error) {
+	streamer, ok := w.ai.(StreamCompleter)
+	if !ok {
+		return nil, fmt.Errorf("gitloom: the wrapped completer does not support streaming")
+	}
+	if h.ChatId == "" {
+		return streamer.ChatCompletionStream(h, callback)
+	}
+	ctx := context.Background()
+	conv, err := w.conversation(ctx, h.ChatId)
+	if err != nil {
+		return nil, err
+	}
+	fresh := h.Messages
+	var lastUser string
+	for i := len(fresh) - 1; i >= 0; i-- {
+		if fresh[i].Role == models.User {
+			lastUser = fresh[i].Message
+			break
+		}
+	}
+	memoryCtx, err := conv.Context(ctx, lastUser)
+	if err != nil {
+		memoryCtx = ""
+	}
+	out := conv.History(h.SystemMsg)
+	if memoryCtx != "" {
+		if out.Context != "" {
+			out.Context += "\n\n" + memoryCtx
+		} else {
+			out.Context = memoryCtx
+		}
+	}
+	out.Messages = append(out.Messages, fresh...)
+
+	resp, err := streamer.ChatCompletionStream(out, callback)
+	if err != nil {
+		return nil, err
+	}
+	stored := append([]models.AIMessage{}, fresh...)
+	stored = append(stored, models.AIMessage{Role: models.Assistant, Message: resp.AIResponse})
+	if err := conv.Append(ctx, stored, resp); err != nil {
+		return resp, fmt.Errorf("gitloom: reply produced but not stored: %w", err)
+	}
+	return resp, nil
+}
+
+// Conversation exposes the managed conversation behind a ChatId — the added
+// features the provider SDK does not have: Rewind, Edit, EditInPlace,
+// SetTitle, Branches, Ingest. It is the SAME object the completions flow
+// through, so a rewind here is what the next ChatCompletion continues from.
+func (w *WrappedKarma) Conversation(ctx context.Context, chatID string) (*Conversation, error) {
+	return w.conversation(ctx, chatID)
+}
+
+// Memory is the underlying client, for direct Recall/Remember/media.
+func (w *WrappedKarma) Memory() *Client { return w.client }

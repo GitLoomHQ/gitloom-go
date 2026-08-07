@@ -1,78 +1,62 @@
 # gitloom-go
 
-Go SDK for [GitLoom](https://gitloom.cloud) — conversations that cannot outgrow
-their context window, backed by a memory the model can consult.
-
-Built as an extension of [karma](https://github.com/MelloB1989/karma): karma
-speaks to every provider and reports token usage on each call; this package
-supplies the conversation that remembers.
+Go SDK for [GitLoom](https://gitloom.cloud) — a **drop-in replacement for
+[karma](https://github.com/MelloB1989/karma)'s completion calls**. Same method
+signatures; a `ChatId` makes the conversation manage itself: rolling context
+window, memory retrieval, storage, compaction, titles.
 
 ```bash
 go get github.com/GitLoomHQ/gitloom-go/gitloom
 ```
 
-## The whole loop in one call
+## Drop-in
 
 ```go
 client := gitloom.New("") // reads GITLOOM_API_KEY
 
-kai := ai.NewKarmaAI(ai.GPT4o, ai.OpenAI)
-conv, _ := client.NewConversation(ctx, "chat-42", gitloom.ConversationOptions{
-    Model:     "gpt-4o",
-    Namespace: userID,
-})
-chat := gitloom.NewChat(kai, conv, "You are a helpful assistant.")
+kai := gitloom.WrapKarma(
+    ai.NewKarmaAI(ai.GPT4o, ai.OpenAI),   // the karma you already use
+    client,
+    gitloom.ConversationOptions{Model: "gpt-4o", Namespace: userID},
+)
 
-resp, _ := chat.Say(ctx, "What camera do I own?")
-```
-
-Every `Say`:
-- retrieves relevant memories and hands them to the model as background,
-- fits the history inside the model's window,
-- stores both turns — with the provider's **real** token count,
-- compacts on cadence (default every 5 exchanges) or when the window fills,
-  and each compaction feeds the summarized turns to memory ingestion.
-
-## Multimodal
-
-karma's `AIMessage` carries images and files as URLs or data URLs. Data URLs
-are uploaded to GitLoom transparently on append; the stored message references
-the attachment, so the conversation replays with the media it ran with.
-
-```go
-chat.SayMessage(ctx, models.AIMessage{
-    Role:    models.User,
-    Message: "what's in this photo?",
-    Images:  []string{"data:image/png;base64," + b64},
+// karma's own signature — switch the receiver, change nothing else.
+resp, _ := kai.ChatCompletion(models.AIChatHistory{
+    ChatId:   "chat-42", // ← the only change
+    Messages: []models.AIMessage{{Role: models.User, Message: "What camera do I own?"}},
 })
 ```
 
-## Branching, edits, rewind
+That's the whole loop. Pass **only the new messages** — never append anything.
+Behind the call: the stored conversation supplies the earlier turns, memory is
+retrieved and injected as background, both turns are stored with karma's real
+token count, compaction runs on cadence (default every 5 exchanges) or window
+pressure, and every compaction feeds the summarized turns to memory ingestion.
+No `ChatId` passes straight through. `ChatCompletionStream` works identically —
+chunks stream through your callback, the exchange is stored at the end.
+
+Compaction is your choice: `Summarize: gitloom.KarmaSummarizer(kai)` runs
+locally on your model; `SummarizeServer: true` hands it to GitLoom's model, no
+model wired into the client.
+
+## Added features, on the same wrapper
 
 ```go
-conv.Rewind(ctx, 6)                             // fork after seq 6, switch to it
-conv.Edit(ctx, 4, models.AIMessage{...})        // replace seq 4 on a new branch
-conv.EditInPlace(ctx, 4, "[redacted]")          // destroy the original, for PII
-conv.SetTitle(ctx, "Camera shopping")           // or let ingestion title it
+conv, _ := kai.Conversation(ctx, "chat-42")   // the SAME managed conversation
+
+conv.Rewind(ctx, 6)                           // fork after seq 6
+conv.Edit(ctx, 4, models.AIMessage{Role: models.User, Message: "ask differently"})
+conv.EditInPlace(ctx, 4, "[redacted]")        // destroy the original (PII)
+conv.SetTitle(ctx, "Camera shopping")
+conv.Branches(ctx)
 ```
 
-Nothing is ever deleted by `Rewind` or `Edit` — the old line keeps its
-messages and compactions. `EditInPlace` is the one deliberate exception.
+A rewind or edit here is what the next `ChatCompletion` continues from.
 
-## Memory, directly
-
-```go
-client.Remember(ctx, []gitloom.Turn{{Role: "user", Content: "I moved to Pune."}}, nil)
-
-res, _ := client.Recall(ctx, "where do I live?", nil)
-for _, h := range res.Hits {
-    fmt.Println(h.Snippet, h.Scores.Arms, h.Provenance.When)
-}
-```
-
-Every hit carries its evidence: per-arm scores, git history with the last
-diff, and labelled relation snippets — the same shape every GitLoom surface
-returns.
+Direct memory: `kai.Memory().Recall(ctx, ...)` / `.Remember(ctx, ...)` — every
+hit carries per-arm scores, git history with the last diff, and relation
+snippets. Data-URL images and files in `AIMessage` are uploaded transparently
+and stored by reference.
 
 ## Docs
 

@@ -357,3 +357,42 @@ func TestServerSideCompaction(t *testing.T) {
 		t.Fatalf("auto flag missing: %+v", api.compactions[0])
 	}
 }
+
+// The features accessor returns the SAME conversation the completions flow
+// through: an edit there is what the next completion continues from.
+func TestWrapperFeaturesShareState(t *testing.T) {
+	_, client := newFakeAPI(t)
+	ai := &fakeCompleter{reply: "r", tokens: 1}
+	kai := WrapKarma(ai, client, ConversationOptions{Model: "gpt-4o"})
+
+	if _, err := kai.ChatCompletion(models.AIChatHistory{
+		ChatId:   "conv-1",
+		Messages: []models.AIMessage{{Role: models.User, Message: "original"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	conv, err := kai.Conversation(t.Context(), "conv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Edit(t.Context(), 0, models.AIMessage{Role: models.User, Message: "edited"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kai.ChatCompletion(models.AIChatHistory{
+		ChatId:   "conv-1",
+		Messages: []models.AIMessage{{Role: models.User, Message: "continue"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	last := ai.calls[len(ai.calls)-1]
+	var joined string
+	for _, m := range last.Messages {
+		joined += string(m.Role) + ":" + m.Message + "|"
+	}
+	if !strings.Contains(joined, "user:edited") {
+		t.Fatalf("the completion did not continue from the edited branch: %s", joined)
+	}
+	if strings.Contains(joined, "user:original|") {
+		t.Fatalf("the original message leaked into the edited branch: %s", joined)
+	}
+}
