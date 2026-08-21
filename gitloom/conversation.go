@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -78,6 +80,11 @@ type Conversation struct {
 }
 
 // NewConversation creates (or re-creates, idempotently) a stored conversation.
+//
+// The server answers 409 for an id that already exists; that is resumption,
+// not failure — the caller gets the conversation shell and the Load that
+// always follows hydrates it. Without this, every wrapper (WrapKarma and
+// friends) broke the moment a conversation outlived one process.
 func (c *Client) NewConversation(ctx context.Context, id string, opts ConversationOptions) (*Conversation, error) {
 	if opts.Namespace == "" {
 		opts.Namespace = c.namespace
@@ -94,6 +101,10 @@ func (c *Client) NewConversation(ctx context.Context, id string, opts Conversati
 		NextSeq int64  `json:"next_seq"`
 	}
 	if err := c.request(ctx, "POST", "/v1/conversations", body, &res); err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status == http.StatusConflict {
+			return &Conversation{ID: id, Branch: "main", client: c, opts: opts}, nil
+		}
 		return nil, err
 	}
 	return &Conversation{ID: id, Branch: res.Branch, client: c, opts: opts, nextSeq: res.NextSeq, Title: opts.Title}, nil
