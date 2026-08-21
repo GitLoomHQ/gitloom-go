@@ -79,6 +79,12 @@ type Conversation struct {
 	reportedTokens int
 }
 
+// NextSeq is the sequence the next appended message will take. After an
+// exchange lands, the two turns it wrote sit at [NextSeq()-2, NextSeq()-1] —
+// which is exactly the range a caller hands to Ingest for
+// remember-as-you-go instead of waiting for the idle sweep.
+func (conv *Conversation) NextSeq() int64 { return conv.nextSeq }
+
 // NewConversation creates (or re-creates, idempotently) a stored conversation.
 //
 // The server answers 409 for an id that already exists; that is resumption,
