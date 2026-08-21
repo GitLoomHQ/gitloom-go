@@ -110,6 +110,14 @@ func (c *Client) NewConversation(ctx context.Context, id string, opts Conversati
 	return &Conversation{ID: id, Branch: res.Branch, client: c, opts: opts, nextSeq: res.NextSeq, Title: opts.Title}, nil
 }
 
+// DeleteConversation removes a stored conversation outright — its messages,
+// compactions and branches. Memories already extracted from it live in the
+// namespace's repository and survive; forgetting facts is the memories API's
+// territory, not a side effect of tidying a chat list.
+func (c *Client) DeleteConversation(ctx context.Context, id string) error {
+	return c.request(ctx, "DELETE", "/v1/conversations/"+url.PathEscape(id), nil, nil)
+}
+
 // LoadConversation resumes a stored conversation from its last compaction.
 func (c *Client) LoadConversation(ctx context.Context, id string, opts ConversationOptions) (*Conversation, error) {
 	conv := &Conversation{ID: id, client: c, opts: opts}
