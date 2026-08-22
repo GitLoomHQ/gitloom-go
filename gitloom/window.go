@@ -35,7 +35,32 @@ func (conv *Conversation) Context(ctx context.Context, userMessage string) (stri
 	if mode != MemoryQuery || strings.TrimSpace(userMessage) == "" {
 		return "", nil
 	}
-	return conv.client.Context(ctx, userMessage, &RecallOptions{Namespace: conv.opts.Namespace})
+
+	emit := conv.opts.OnEvent
+	if emit != nil {
+		emit(WrapEvent{Kind: "memory.recall"})
+	}
+	res, err := conv.client.Recall(ctx, userMessage, &RecallOptions{Namespace: conv.opts.Namespace})
+	if err != nil {
+		if emit != nil {
+			emit(WrapEvent{Kind: "memory.recall.done", Err: err})
+		}
+		return "", err
+	}
+	if emit != nil {
+		emit(WrapEvent{Kind: "memory.recall.done", Hits: len(res.Hits)})
+	}
+	if len(res.Hits) == 0 {
+		return "", nil
+	}
+	var b strings.Builder
+	b.WriteString("What you already know about this user, from earlier conversations. Treat it as background, not as something they just said:\n")
+	for _, h := range res.Hits {
+		b.WriteString("- ")
+		b.WriteString(h.Snippet)
+		b.WriteByte('\n')
+	}
+	return b.String(), nil
 }
 
 // Compact summarizes what the window can no longer hold and hands the evicted

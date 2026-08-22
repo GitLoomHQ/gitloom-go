@@ -59,6 +59,22 @@ type ConversationOptions struct {
 	// Title names the conversation at creation. Left empty, ingestion
 	// generates one.
 	Title string
+	// OnEvent observes the managed steps of a completion — memory retrieval
+	// today, more later — so a caller can surface them (a chat UI showing
+	// "searching memory…") without owning the steps. Called synchronously on
+	// the completion's goroutine; nil means no observation.
+	OnEvent func(WrapEvent)
+}
+
+// WrapEvent is one observable step of a managed completion.
+type WrapEvent struct {
+	// Kind names the step: "memory.recall" when retrieval starts,
+	// "memory.recall.done" when it lands.
+	Kind string
+	// Hits is how many memories retrieval returned (recall.done only).
+	Hits int
+	// Err is set when the step failed; the completion itself continues.
+	Err error
 }
 
 // Conversation is a stored chat with a rolling context window.
