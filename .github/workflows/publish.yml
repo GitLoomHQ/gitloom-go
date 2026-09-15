@@ -1,0 +1,64 @@
+name: Publish
+
+# Go has no registry to push to: a version exists because a tag exists, and
+# the module proxy serves it on first request. So this verifies the tag is
+# publishable and then warms the proxy, rather than uploading anything.
+#
+# It cannot be undone either — the proxy caches a tag immutably, and a
+# retracted version still needs a `retract` directive in a later release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: go-module
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go vet ./...
+      - run: go test ./...
+
+      # v-prefixed and semver, or the proxy will not serve it as a version.
+      - name: Tag is a usable module version
+        if: github.event_name == 'release'
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || {
+            echo "::error::tag $tag is not a Go module version (want vMAJOR.MINOR.PATCH)"; exit 1; }
+          major=${tag%%.*}; major=${major#v}
+          if [ "$major" -ge 2 ]; then
+            grep -q "^module .*/v$major$" go.mod || {
+              echo "::error::v$major needs a /v$major suffix on the module path in go.mod"; exit 1; }
+          fi
+
+      # The first `go get` of a new version otherwise pays for the proxy's
+      # cold fetch, and a module that fails to build there fails for everyone.
+      - name: Warm the module proxy
+        if: github.event_name == 'release'
+        env:
+          GOPROXY: https://proxy.golang.org
+          GOFLAGS: -mod=mod
+        run: |
+          mod=$(go list -m)
+          tag="${{ github.event.release.tag_name }}"
+          for attempt in 1 2 3 4 5; do
+            if go list -m "$mod@$tag"; then
+              echo "proxy serving $mod@$tag"; exit 0
+            fi
+            echo "proxy has not indexed $tag yet; retrying in 30s"; sleep 30
+          done
+          echo "::error::proxy did not serve $mod@$tag after 5 attempts"; exit 1

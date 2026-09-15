@@ -1,14 +1,40 @@
 name: Tests
+
 on:
-  push: { branches: [main] }
+  push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.24' }
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - run: gofmt -l gitloom/ | tee /dev/stderr | wc -l | grep -q '^0$'
       - run: go vet ./...
       - run: go test ./...
+
+      # An SDK is consumed concurrently by definition — one client shared
+      # across an application's goroutines — and the race detector is the only
+      # thing that checks the claim.
+      - run: go test -race ./...
+
+      - name: go.mod is tidy
+        run: |
+          cp go.mod go.mod.bak && cp go.sum go.sum.bak
+          go mod tidy
+          diff -u go.mod.bak go.mod && diff -u go.sum.bak go.sum \
+            || { echo "::error::run 'go mod tidy' and commit the result"; exit 1; }
