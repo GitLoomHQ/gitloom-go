@@ -3,12 +3,15 @@ package gitloom
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MelloB1989/karma/models"
 )
@@ -16,14 +19,17 @@ import (
 // fakeAPI keeps the server's invariants: sequences advance, messages are never
 // deleted, compactions are recorded rather than applied.
 type fakeAPI struct {
-	mu          sync.Mutex
-	messages    []map[string]any
-	compactions []map[string]any
-	uploads     []string // content types, in order
-	title       string
-	nextSeq     int64
-	branch      string
-	remembered  int
+	mu              sync.Mutex
+	messages        []map[string]any
+	compactions     []map[string]any
+	uploads         []string // content types, in order
+	title           string
+	nextSeq         int64
+	retrieveQueries []url.Values
+	skillQueries    []url.Values
+	forgotten       string
+	branch          string
+	remembered      int
 }
 
 func newFakeAPI(t *testing.T) (*fakeAPI, *Client) {
@@ -53,9 +59,46 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 		f.remembered++
 		send(map[string]any{"status": "accepted"})
 	case p == "/v1/retrieve":
-		send(map[string]any{"namespace": "ns", "hits": []map[string]any{
-			{"path": "facts/a.md", "score": 0.5, "snippet": "the user prefers Go"},
-		}, "millis": 3})
+		f.retrieveQueries = append(f.retrieveQueries, r.URL.Query())
+		if mode := r.URL.Query().Get("mode"); mode != "" {
+			send(map[string]any{"namespace": "ns", "mode": mode,
+				"answer": "They prefer Go.", "model": "haiku",
+				"memories": []map[string]any{{"path": "facts/a.md", "content": "the user prefers Go",
+					"score": 0.9, "matched": []string{"cue"}}},
+				"millis": 9})
+			return
+		}
+		send(map[string]any{"namespace": "ns", "mode": "raw", "memories": []map[string]any{
+			{"path": "facts/a.md", "tier": "facts", "content": "the user prefers Go",
+				"score": 0.9, "matched": []string{"lexical", "cue"}},
+		}, "candidates": 2, "filtered_out": 1, "millis": 3})
+	case p == "/v1/vocab" && r.Method == "POST":
+		send(map[string]any{"id": "j1", "namespace": "ns", "status": "accepted"})
+	case p == "/v1/vocab" && r.Method == "DELETE":
+		f.forgotten = r.URL.Query().Get("term")
+		send(map[string]any{"id": "j2", "namespace": "ns", "status": "accepted"})
+	case p == "/v1/vocab":
+		if word := r.URL.Query().Get("word"); word != "" {
+			if word == "k8s" {
+				send(map[string]any{"namespace": "ns", "word": word, "found": true,
+					"term": map[string]any{"term": "kubernetes", "aliases": []string{"k8s"}}})
+				return
+			}
+			send(map[string]any{"namespace": "ns", "word": word, "found": false})
+			return
+		}
+		send(map[string]any{"namespace": "ns", "terms": []map[string]any{
+			{"term": "kubernetes", "aliases": []string{"k8s"}},
+		}})
+	case p == "/v1/skills" && r.Method == "POST":
+		send(map[string]any{"id": "j3", "namespace": "ns", "status": "accepted",
+			"paths": []string{"skills/ops/deploy.md"}})
+	case p == "/v1/skills":
+		f.skillQueries = append(f.skillQueries, r.URL.Query())
+		send(map[string]any{"namespace": "ns", "skills": []map[string]any{
+			{"path": "skills/ops/deploy.md", "name": "Deploy", "content": "Run make deploy.",
+				"score": 0.8, "matched": []string{"cue"}},
+		}})
 	case p == "/v1/conversations" && r.Method == "POST":
 		send(map[string]any{"branch": "main", "next_seq": f.nextSeq})
 	case strings.HasSuffix(p, "/messages") && r.Method == "POST":
@@ -394,5 +437,149 @@ func TestWrapperFeaturesShareState(t *testing.T) {
 	}
 	if strings.Contains(joined, "user:original|") {
 		t.Fatalf("the original message leaked into the edited branch: %s", joined)
+	}
+}
+
+// Retrieval returns whole memories now, and every filter must reach the wire:
+// they are applied inside each arm server-side, so one dropped here silently
+// widens the search rather than failing.
+func TestRecallReturnsMemoriesAndSendsEveryFilter(t *testing.T) {
+	f := &fakeAPI{}
+	srv := httptest.NewServer(http.HandlerFunc(f.handle))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	res, err := c.Recall(context.Background(), "what do they like", &RecallOptions{
+		Tiers: []string{"facts", "skills"},
+		Paths: []string{"facts/events", "incidents"},
+		Tags:  []string{"pref"}, TagsAll: []string{"a", "b"},
+		Since:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		MinScore: 0.4, NoContext: true, Detail: "full", Limit: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Memories) != 1 || res.Memories[0].Content != "the user prefers Go" {
+		t.Fatalf("memories = %+v", res.Memories)
+	}
+	if res.FilteredOut != 1 || res.Memories[0].Score != 0.9 {
+		t.Errorf("envelope lost: filtered_out=%d score=%v", res.FilteredOut, res.Memories[0].Score)
+	}
+	q := f.retrieveQueries[0]
+	for key, want := range map[string]string{
+		"tiers": "facts,skills", "paths": "facts/events,incidents", "tags_all": "a,b",
+		"min_score": "0.4", "context": "0", "detail": "full", "limit": "5",
+	} {
+		if q.Get(key) != want {
+			t.Errorf("%s = %q, want %q", key, q.Get(key), want)
+		}
+	}
+	if q.Get("since") == "" {
+		t.Error("since was not sent")
+	}
+}
+
+func TestRecallLeavesDefaultsOffTheWire(t *testing.T) {
+	f := &fakeAPI{}
+	srv := httptest.NewServer(http.HandlerFunc(f.handle))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	if _, err := c.Recall(context.Background(), "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.retrieveQueries[0]); got != 2 {
+		t.Errorf("sent %d params, want just q and namespace: %v", got, f.retrieveQueries[0])
+	}
+}
+
+func TestAnswerSummarizesAndGoesAgenticOnRequest(t *testing.T) {
+	f := &fakeAPI{}
+	srv := httptest.NewServer(http.HandlerFunc(f.handle))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	res, err := c.Answer(context.Background(), "what do they like", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Answer != "They prefer Go." || f.retrieveQueries[0].Get("mode") != "summary" {
+		t.Errorf("answer=%q mode=%q", res.Answer, f.retrieveQueries[0].Get("mode"))
+	}
+	if _, err := c.Answer(context.Background(), "x", &RecallOptions{Mode: ModeAgentic}); err != nil {
+		t.Fatal(err)
+	}
+	if f.retrieveQueries[1].Get("mode") != "agentic" {
+		t.Errorf("mode = %q, want agentic", f.retrieveQueries[1].Get("mode"))
+	}
+}
+
+// An empty answer must be an error rather than an empty string a caller shows
+// to a user.
+func TestAnswerRefusesToReturnNothing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.Write([]byte(`{"namespace":"ns","mode":"summary","memories":[]}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	if _, err := c.Answer(context.Background(), "x", nil); !errors.Is(err, ErrNoAnswer) {
+		t.Errorf("err = %v, want ErrNoAnswer", err)
+	}
+}
+
+func TestVocabRoundTrip(t *testing.T) {
+	f := &fakeAPI{}
+	srv := httptest.NewServer(http.HandlerFunc(f.handle))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+	ctx := context.Background()
+
+	if _, err := c.LearnTerms(ctx, []Term{{Term: "kubernetes", Aliases: []string{"k8s"}}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	terms, err := c.Vocabulary(ctx, nil)
+	if err != nil || len(terms) != 1 || terms[0].Term != "kubernetes" {
+		t.Fatalf("terms = %+v err = %v", terms, err)
+	}
+	term, ok, err := c.LookupTerm(ctx, "k8s", "")
+	if err != nil || !ok || term.Term != "kubernetes" {
+		t.Fatalf("lookup = %+v ok=%v err=%v", term, ok, err)
+	}
+	if _, ok, _ := c.LookupTerm(ctx, "zzz", ""); ok {
+		t.Error("an unknown word should report not-found, not an error")
+	}
+	if _, err := c.ForgetTerms(ctx, []string{"kubernetes", "postgres"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if f.forgotten != "kubernetes,postgres" {
+		t.Errorf("forgot %q", f.forgotten)
+	}
+}
+
+func TestSkillsStoreAndFind(t *testing.T) {
+	f := &fakeAPI{}
+	srv := httptest.NewServer(http.HandlerFunc(f.handle))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+	ctx := context.Background()
+
+	acc, err := c.StoreSkills(ctx, []Skill{{Name: "Deploy", Topic: "ops", Content: "Run make deploy."}}, "")
+	if err != nil || len(acc.Paths) != 1 {
+		t.Fatalf("store = %+v err = %v", acc, err)
+	}
+	found, err := c.FindSkills(ctx, "ship a release", &SkillOptions{Paths: []string{"ops"}, Limit: 3})
+	if err != nil || len(found) != 1 || found[0].Name != "Deploy" {
+		t.Fatalf("find = %+v err = %v", found, err)
+	}
+	if q := f.skillQueries[0]; q.Get("q") != "ship a release" || q.Get("paths") != "ops" {
+		t.Errorf("query = %v", q)
+	}
+	if _, err := c.FindSkills(ctx, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if f.skillQueries[1].Get("q") != "" {
+		t.Error("listing must not send a query")
 	}
 }

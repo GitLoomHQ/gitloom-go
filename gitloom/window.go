@@ -48,16 +48,20 @@ func (conv *Conversation) Context(ctx context.Context, userMessage string) (stri
 		return "", err
 	}
 	if emit != nil {
-		emit(WrapEvent{Kind: "memory.recall.done", Hits: len(res.Hits)})
+		emit(WrapEvent{Kind: "memory.recall.done", Hits: len(res.Memories)})
 	}
-	if len(res.Hits) == 0 {
+	if len(res.Memories) == 0 {
 		return "", nil
 	}
 	var b strings.Builder
 	b.WriteString("What you already know about this user, from earlier conversations. Treat it as background, not as something they just said:\n")
-	for _, h := range res.Hits {
+	for _, m := range res.Memories {
+		text := m.Content
+		if text == "" {
+			text = m.Snippet
+		}
 		b.WriteString("- ")
-		b.WriteString(h.Snippet)
+		b.WriteString(text)
 		b.WriteByte('\n')
 	}
 	return b.String(), nil
