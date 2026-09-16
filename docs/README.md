@@ -53,10 +53,70 @@ conv.Branches(ctx)
 
 A rewind or edit here is what the next `ChatCompletion` continues from.
 
-Direct memory: `kai.Memory().Recall(ctx, ...)` / `.Remember(ctx, ...)` — every
-hit carries per-arm scores, git history with the last diff, and relation
-snippets. Data-URL images and files in `AIMessage` are uploaded transparently
-and stored by reference.
+Data-URL images and files in `AIMessage` are uploaded transparently and stored
+by reference.
+
+## Recall, filtered and answered
+
+```go
+mem := kai.Memory()
+
+// Ranked memories, no model call. Milliseconds.
+res, _ := mem.Recall(ctx, "what camera do I own", &gitloom.RecallOptions{
+    Tiers:    []string{"facts"},        // facts, incidents, rules, skills
+    Paths:    []string{"facts/gear"},   // any directories
+    Tags:     []string{"camera"},
+    Since:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+    MinScore: 0.3,
+    Limit:    8,
+})
+for _, m := range res.Memories {
+    fmt.Printf("%.2f %s %v\n%s\n", m.Score, m.Path, m.Matched, m.Content)
+}
+
+// One text answer from a fast model over that retrieval …
+ans, _ := mem.Answer(ctx, "what camera do I own", nil)
+// … or let a stronger model search the memory itself with tools.
+agentic, _ := mem.Answer(ctx, "which trip had the longest flight",
+    &gitloom.RecallOptions{Mode: gitloom.ModeAgentic})
+fmt.Println(agentic.Answer, agentic.Trace)
+```
+
+Each entry is one whole memory, not a scattering of its sections, and its
+score is calibrated in `[0, 1]` — comparable across queries, so `MinScore`
+means the same thing every time. `Detail: "full"` adds git history with the
+last diff, labelled relation snippets and cues.
+
+`Answer` meters as a chat rather than a read, and returns `ErrNoAnswer` rather
+than an empty string when the model finds nothing to say.
+
+## Vocabulary and skills
+
+```go
+// Teach abbreviations and domain terms. A recall for "k8s" then also finds
+// memories written "kubernetes", and the definition comes back as Defined.
+mem.LearnTerms(ctx, []gitloom.Term{{
+    Term:       "kubernetes",
+    Aliases:    []string{"k8s", "kube"},
+    Definition: "Container orchestration.",
+}}, "")
+mem.LookupTerm(ctx, "k8s", "")                                  // → Term, true, nil
+mem.Vocabulary(ctx, &gitloom.VocabOptions{Like: "kube"})
+mem.ForgetTerms(ctx, []string{"kubernetes"}, "")
+
+// Store how things are done; find the skill that fits a task.
+mem.StoreSkills(ctx, []gitloom.Skill{{
+    Name:        "Deploy to production",
+    Topic:       "ops",
+    Description: "Ship a release.",
+    Content:     "## Steps\n1. Tag the release.\n2. `make deploy ENV=prod`",
+    Triggers:    []string{"how do I ship a release", "deploy to prod"},
+}}, "")
+skills, _ := mem.FindSkills(ctx, "release the new build", nil)
+```
+
+Skills are memories under the `skills/` tier, so a recall with
+`Tiers: []string{"skills"}` reaches them too.
 
 ## Docs
 
