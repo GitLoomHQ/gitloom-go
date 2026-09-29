@@ -90,6 +90,31 @@ last diff, labelled relation snippets and cues.
 `Answer` meters as a chat rather than a read, and returns `ErrNoAnswer` rather
 than an empty string when the model finds nothing to say.
 
+### The lane path
+
+`Rank` retrieves on the lane path: lexical, cue, body, graph and time lanes each
+search on their own, over the curated memories and the conversation turns, and
+the time lane reads dates in the question ("last month", "in May"). `RankFused`
+orders what they find by lane score; `RankJev` has a ranking model order it, and
+sets `RankFallback` when it answers in lane order instead.
+
+```go
+res, _ := mem.Recall(ctx, "when did I stake the tomatoes",
+    &gitloom.RecallOptions{Rank: gitloom.RankFused, MaxChars: 8000})
+for _, m := range res.Memories {
+    fmt.Println(m.Store, m.Said, m.Excerpted, m.Content)
+}
+
+ans, _ := mem.Answer(ctx, "what did I plant after the storm",
+    &gitloom.RecallOptions{Rank: gitloom.RankJev, Model: gitloom.ModelSonnet})
+```
+
+Each memory then says which `Store` it came from (`"memory"`, or a word-for-word
+conversation `"turn"`) and the days it was `Said`. `MaxChars` caps the memory
+content returned: a memory that does not fit is cut to its opening sentence and
+the sentences matching the question, and marked `Excerpted`. `Model` picks the
+model that reads the memories in `ModeSummary` or `ModeAgentic`.
+
 ## Vocabulary and skills
 
 ```go
