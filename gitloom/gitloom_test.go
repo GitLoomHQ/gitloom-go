@@ -493,6 +493,75 @@ func TestRecallLeavesDefaultsOffTheWire(t *testing.T) {
 	}
 }
 
+func TestRecallSendsTheLanePathAndReadsWhatItAdds(t *testing.T) {
+	var q url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q = r.URL.Query()
+		w.Write([]byte(`{"namespace":"ns","query":"x","mode":"summary","rank":"jev","rank_fallback":true,
+			"memories":[{"path":"turns/conv-1/main/000001-user-aa.md","tier":"facts",
+				"content":"user: I staked the tomatoes …","score":0.8,"matched":["lexical","time"],
+				"store":"turn","said":["2026-05-21"],"excerpted":true}],
+			"candidates":9,"filtered_out":0,"millis":40,
+			"timings":{"lexical_ms":0,"vector_ms":0,"graph_ms":0,"embed_ms":20,"lanes_ms":8,"rank_ms":300,
+				"lane":[{"lane":"time","store":"turn","ms":2,"n":1},{"lane":"graph","store":"memory","ms":1,"n":0,"err":"timeout"}]}}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	res, err := c.Recall(context.Background(), "x", &RecallOptions{
+		Mode: ModeSummary, Rank: RankJev, MaxChars: 12000, Model: ModelSonnet,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{"rank": "jev", "max_chars": "12000", "model": "sonnet"} {
+		if q.Get(key) != want {
+			t.Errorf("%s = %q, want %q", key, q.Get(key), want)
+		}
+	}
+	if res.Rank != RankJev || !res.RankFallback {
+		t.Errorf("rank = %q, fallback = %v", res.Rank, res.RankFallback)
+	}
+	m := res.Memories[0]
+	if m.Store != "turn" || strings.Join(m.Said, ",") != "2026-05-21" || !m.Excerpted || m.Matched[1] != "time" {
+		t.Errorf("memory = %+v", m)
+	}
+	tm := res.Timings
+	if tm.EmbedMillis != 20 || tm.LanesMillis != 8 || tm.RankMillis != 300 || len(tm.Lane) != 2 {
+		t.Fatalf("timings = %+v", tm)
+	}
+	if tm.Lane[0] != (LaneTiming{Lane: "time", Store: "turn", Millis: 2, N: 1}) || tm.Lane[1].Err != "timeout" {
+		t.Errorf("lanes = %+v", tm.Lane)
+	}
+}
+
+// A call that predates the lane path must send the query string it always
+// did, and read back the envelope it always did.
+func TestLanePathStaysOffTheWireUnlessAsked(t *testing.T) {
+	var raw []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw = append(raw, r.URL.RawQuery)
+		w.Write([]byte(`{"namespace":"ns","mode":"raw","memories":[],"millis":1}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+	ctx := context.Background()
+
+	res, err := c.Recall(ctx, "x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Recall(ctx, "x", &RecallOptions{Limit: 5, MaxChars: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"namespace=ns&q=x", "limit=5&namespace=ns&q=x"}; strings.Join(raw, " ") != strings.Join(want, " ") {
+		t.Errorf("queries = %q, want %q", raw, want)
+	}
+	if res.Rank != "" || res.RankFallback {
+		t.Errorf("rank = %q, fallback = %v", res.Rank, res.RankFallback)
+	}
+}
+
 func TestAnswerSummarizesAndGoesAgenticOnRequest(t *testing.T) {
 	f := &fakeAPI{}
 	srv := httptest.NewServer(http.HandlerFunc(f.handle))
@@ -511,6 +580,25 @@ func TestAnswerSummarizesAndGoesAgenticOnRequest(t *testing.T) {
 	}
 	if f.retrieveQueries[1].Get("mode") != "agentic" {
 		t.Errorf("mode = %q, want agentic", f.retrieveQueries[1].Get("mode"))
+	}
+}
+
+func TestAnswerPassesTheLanePathThrough(t *testing.T) {
+	f := &fakeAPI{}
+	srv := httptest.NewServer(http.HandlerFunc(f.handle))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	if _, err := c.Answer(context.Background(), "x", &RecallOptions{
+		Rank: RankFused, MaxChars: 8000, Model: ModelHaiku,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.retrieveQueries[0]
+	for key, want := range map[string]string{"mode": "summary", "rank": "fused", "max_chars": "8000", "model": "haiku"} {
+		if q.Get(key) != want {
+			t.Errorf("%s = %q, want %q", key, q.Get(key), want)
+		}
 	}
 }
 

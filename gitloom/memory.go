@@ -34,11 +34,19 @@ type Memory struct {
 	// within one response.
 	Score float64 `json:"score"`
 	// Matched names the arms that produced this memory: lexical, cue, body,
-	// graph. Matched only by graph means context that rode in beside a real
-	// match rather than evidence, and Via names what pulled it in.
+	// graph, and on the lane path time. Matched only by graph means context
+	// that rode in beside a real match rather than evidence, and Via names
+	// what pulled it in.
 	Matched  []string `json:"matched"`
 	Sections []string `json:"sections,omitempty"`
 	Via      []string `json:"via,omitempty"`
+
+	// Store, Said and Excerpted are set on the lane path: a curated "memory"
+	// or a word-for-word conversation "turn", the days it was stated oldest
+	// first, and whether Content was cut to fit MaxChars.
+	Store     string   `json:"store,omitempty"`
+	Said      []string `json:"said,omitempty"`
+	Excerpted bool     `json:"excerpted,omitempty"`
 
 	Tags       []string `json:"tags,omitempty"`
 	Created    string   `json:"created,omitempty"`
@@ -105,12 +113,25 @@ type TraceEvent struct {
 }
 
 // Timings says where a retrieval spent its time. ModelMillis is set only when
-// a mode ran one.
+// a mode ran one; the rest after it only on the lane path.
 type Timings struct {
-	LexicalMillis int64 `json:"lexical_ms"`
-	VectorMillis  int64 `json:"vector_ms"`
-	GraphMillis   int64 `json:"graph_ms"`
-	ModelMillis   int64 `json:"model_ms,omitempty"`
+	LexicalMillis int64        `json:"lexical_ms"`
+	VectorMillis  int64        `json:"vector_ms"`
+	GraphMillis   int64        `json:"graph_ms"`
+	ModelMillis   int64        `json:"model_ms,omitempty"`
+	EmbedMillis   int64        `json:"embed_ms,omitempty"`
+	LanesMillis   int64        `json:"lanes_ms,omitempty"`
+	RankMillis    int64        `json:"rank_ms,omitempty"`
+	Lane          []LaneTiming `json:"lane,omitempty"`
+}
+
+// LaneTiming is one lane's search of one store.
+type LaneTiming struct {
+	Lane   string `json:"lane"`
+	Store  string `json:"store"`
+	Millis int64  `json:"ms"`
+	N      int    `json:"n"`
+	Err    string `json:"err,omitempty"`
 }
 
 // RecallResult is one retrieval's answer.
@@ -127,6 +148,11 @@ type RecallResult struct {
 	Model     string       `json:"model,omitempty"`
 	Trace     []TraceEvent `json:"trace,omitempty"`
 	Truncated bool         `json:"truncated,omitempty"`
+
+	// Rank is the lane ranking asked for. RankFallback means RankJev could
+	// not rank, so Memories are in lane order.
+	Rank         string `json:"rank,omitempty"`
+	RankFallback bool   `json:"rank_fallback,omitempty"`
 
 	// Candidates is how many distinct memories any arm produced before the
 	// relevance floor; FilteredOut how many that floor dropped. Many filtered
@@ -174,6 +200,18 @@ const (
 	ModeAgentic = "agentic"
 )
 
+// Lane-path rankings: by lane score, or with a ranking model.
+const (
+	RankFused = "fused"
+	RankJev   = "jev"
+)
+
+// Models that can read the memories in ModeSummary or ModeAgentic.
+const (
+	ModelHaiku  = "haiku"
+	ModelSonnet = "sonnet"
+)
+
 // RecallOptions shape one retrieval.
 //
 // Every filter here is applied INSIDE each retrieval arm and to graph
@@ -199,6 +237,13 @@ type RecallOptions struct {
 	// and cues.
 	Detail         string
 	IncludeExpired bool
+
+	// Rank retrieves on the lane path, which also reaches conversation turns
+	// and the dates in a question. Not with ModeAgentic. MaxChars caps the
+	// memory content returned; Model picks the reader.
+	Rank     string
+	MaxChars int
+	Model    string
 }
 
 func (o RecallOptions) query(fallbackNamespace string) url.Values {
@@ -237,6 +282,15 @@ func (o RecallOptions) query(fallbackNamespace string) url.Values {
 	}
 	if o.IncludeExpired {
 		q.Set("include_expired", "1")
+	}
+	if o.Rank != "" {
+		q.Set("rank", o.Rank)
+	}
+	if o.MaxChars > 0 {
+		q.Set("max_chars", strconv.Itoa(o.MaxChars))
+	}
+	if o.Model != "" {
+		q.Set("model", o.Model)
 	}
 	return q
 }
