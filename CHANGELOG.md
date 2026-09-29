@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **`RecallOptions` takes `Rank`, `MaxChars` and `Model`**, for `Recall` and
+  `Answer` alike. `Rank` (`RankFused` or `RankJev`) retrieves on the lane
+  path, which also reaches conversation turns and the dates in a question;
+  `MaxChars` caps the memory content returned; `Model` (`ModelHaiku` or
+  `ModelSonnet`) picks the reader in `ModeSummary` or `ModeAgentic`. None is
+  sent unless set, so existing calls are unchanged.
+- **Lane-path fields.** A `Memory` carries `Store`, `Said` and `Excerpted`;
+  the result carries `Rank` and `RankFallback`, and `Timings` the lane path's
+  `EmbedMillis`, `LanesMillis`, `RankMillis` and per-lane `Lane`.
+
 ## v0.4.0 — 2026-09-16
 
 - **Recall returns memories.** `RecallResult.Hits` becomes `Memories`, and
