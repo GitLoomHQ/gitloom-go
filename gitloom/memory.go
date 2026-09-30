@@ -199,6 +199,17 @@ type RecallOptions struct {
 	// and cues.
 	Detail         string
 	IncludeExpired bool
+
+	// NoProvenance drops each memory's git history (commit, author,
+	// revisions, diff). The server computes it by default, and it costs a
+	// git-log walk PER MEMORY, which dominates the request once memories have
+	// real history behind them — 3.29s with it against 0.40s without,
+	// measured on one production namespace. Turn it off for anything
+	// latency-sensitive that is not going to show a citation.
+	NoProvenance bool
+	// NoRelations drops each memory's neighbours and their snippets. Cheap to
+	// leave on; this exists for bulk scans that only want the text.
+	NoRelations bool
 }
 
 func (o RecallOptions) query(fallbackNamespace string) url.Values {
@@ -237,6 +248,12 @@ func (o RecallOptions) query(fallbackNamespace string) url.Values {
 	}
 	if o.IncludeExpired {
 		q.Set("include_expired", "1")
+	}
+	if o.NoProvenance {
+		q.Set("no_provenance", "1")
+	}
+	if o.NoRelations {
+		q.Set("no_relations", "1")
 	}
 	return q
 }

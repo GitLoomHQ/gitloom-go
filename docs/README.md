@@ -118,6 +118,41 @@ skills, _ := mem.FindSkills(ctx, "release the new build", nil)
 Skills are memories under the `skills/` tier, so a recall with
 `Tiers: []string{"skills"}` reaches them too.
 
+## Direct memory
+
+`Remember` hands GitLoom a conversation and a model decides what is worth
+keeping. These are the other half — for when the caller already knows what the
+memory is and where it belongs: a migration from another store, or an agent
+filing a conclusion it reasoned out itself.
+
+```go
+err := client.Write(ctx, []gitloom.NewMemory{{
+    Path:       "facts/people/maya.md",
+    Content:    "Maya rides a bicycle to work and prefers morning meetings.",
+    Tags:       []string{"people", "colleague"},
+    Confidence: 0.9,
+    Date:       "2026-07-19",                       // what it's ABOUT, not now
+    Cues:       []string{"how does Maya commute"},   // embedded for semantic search
+    Related:    []string{"manager: facts/people/sam.md"},
+}}, nil)
+```
+
+Send them in batches — one call is one commit round and one push, so batching
+is where the cost goes.
+
+```go
+m, _   := client.Get(ctx, "facts/people/maya.md", nil)   // read one back
+err     = client.Forget(ctx, []string{"facts/people/maya.md"}, nil)
+tree, _ := client.Tree(ctx, &gitloom.TreeOptions{Path: "facts", Depth: 3})
+tops, _ := client.Topics(ctx, &gitloom.TopicsOptions{Like: "databas"})
+graph,_ := client.Graph(ctx, nil)
+```
+
+`Tree` is the table of contents a navigator descends instead of guessing at
+search vocabulary. `Topics` is what you call before filing under a new topic,
+so you don't invent `facts/databases` beside an existing `facts/database`.
+`Forget` unpublishes a memory from retrieval; git keeps the history.
+
 ## Docs
 
 https://docs.gitloom.cloud/documentation/go

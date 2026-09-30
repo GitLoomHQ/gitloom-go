@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.5.0 — 2026-09-30
+
+- **Direct memory primitives.** `Write`, `Get`, `Forget`, `Tree`, `Topics`
+  and `Graph` — for a caller that already knows what a memory is and where it
+  belongs, where `Remember` has a model decide. They lived on an unmerged
+  branch until now, so no release had both them and the current `Recall`.
+- **`NewMemory`** is what `Write` takes. It is the write-side twin of the
+  `Memory` that `Recall` returns; the two branches had each named their type
+  `Memory`, and the released one keeps the name.
+- **`RecallOptions.NoProvenance` and `NoRelations`** skip the per-memory git
+  history walk and the neighbour snippets. Provenance is computed by default
+  and dominates latency once memories have history — 3.29s against 0.40s on
+  one production namespace — so turn it off for anything that will not show
+  a citation.
+
 ## v0.4.0 — 2026-09-16
 
 - **Recall returns memories.** `RecallResult.Hits` becomes `Memories`, and
