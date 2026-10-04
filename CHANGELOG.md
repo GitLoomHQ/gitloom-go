@@ -22,6 +22,17 @@
   strings remain, deprecated. A `Memory` marshals back to the API's shape, so
   a result kept as JSON reads back. `StoredMemory`, what `Get` returns,
   carries the same.
+- **Error codes agree across the SDKs.** An `*APIError` keeps the `code` and
+  `message` of the API's `{"error":{...}}` envelope. A 401 or 403 from the
+  gateway in front of it, which has no envelope, is `unauthorized`, with a
+  message pointing at `GITLOOM_API_KEY`. Any other error without an envelope
+  is `http_<status>` where it was `http_error`, with the body's `message`, its
+  text, or the status text; a flat `{"error":"..."}` is no longer read apart.
+- **No key, no request.** With no key passed to `New` and none in
+  `GITLOOM_API_KEY`, every call returns an `*APIError` coded
+  `missing_api_key`, with `Status` 0, instead of sending an empty bearer
+  token. Network failures are unchanged: the cause, wrapped, not an
+  `*APIError`.
 - **`RecallOptions` takes `Rank`, `MaxChars` and `Model`**, for `Recall` and
   `Answer` alike. `Rank` (`RankFused` or `RankJev`) retrieves on the lane
   path, which also reaches conversation turns and the dates in a question;

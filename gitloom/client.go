@@ -60,7 +60,10 @@ func New(apiKey string, opts ...Option) *Client {
 	return c
 }
 
-// APIError is a refusal from the API, carrying its machine-readable code.
+// APIError is a refusal from the API, carrying its machine-readable code: the
+// API's own, "unauthorized" for a key the gateway refused, "http_<status>" for
+// any other error without one, or "missing_api_key" (Status 0) when the client
+// has no key to send.
 type APIError struct {
 	Status  int
 	Code    string
@@ -68,6 +71,9 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string {
+	if e.Status == 0 {
+		return fmt.Sprintf("gitloom: %s (%s)", e.Message, e.Code)
+	}
 	return fmt.Sprintf("gitloom: %s (%d %s)", e.Message, e.Status, e.Code)
 }
 
@@ -75,6 +81,10 @@ func (e *APIError) Error() string {
 // half-succeeded double-charges the meter and double-stores the message, which
 // costs more than surfacing the error.
 func (c *Client) request(ctx context.Context, method, path string, body, out any) error {
+	if c.apiKey == "" {
+		return &APIError{Code: "missing_api_key",
+			Message: "No API key. Pass one to gitloom.New or set GITLOOM_API_KEY."}
+	}
 	var payload io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -114,33 +124,41 @@ func (c *Client) request(ctx context.Context, method, path string, body, out any
 	return nil
 }
 
-// apiErrorFrom decodes both error shapes the API uses: the envelope
-// {"error":{"code","message"}} everywhere, and the flat {"error":"..."} the
-// retrieval routes answer with.
+// apiErrorFrom reads an error response. The API answers with the envelope
+// {"error":{"code","message"}}; the gateway in front of it answers a refused
+// or missing key with a bare {"message"}, and anything else may be text.
 func apiErrorFrom(status int, raw []byte) *APIError {
-	var envelope struct {
-		Error json.RawMessage `json:"error"`
-	}
-	e := &APIError{Status: status, Code: "http_error", Message: strings.TrimSpace(string(raw))}
-	if json.Unmarshal(raw, &envelope) != nil || len(envelope.Error) == 0 {
-		return e
-	}
-	var flat string
-	if json.Unmarshal(envelope.Error, &flat) == nil {
-		e.Message = flat
-		return e
-	}
-	var coded struct {
+	var obj map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &obj)
+	var env struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	}
-	if json.Unmarshal(envelope.Error, &coded) == nil {
-		if coded.Code != "" {
-			e.Code = coded.Code
+	if json.Unmarshal(obj["error"], &env) == nil && env.Code != "" {
+		if env.Message == "" {
+			env.Message = http.StatusText(status)
 		}
-		if coded.Message != "" {
-			e.Message = coded.Message
+		return &APIError{Status: status, Code: env.Code, Message: env.Message}
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return &APIError{Status: status, Code: "unauthorized",
+			Message: "No API key was accepted (401 Unauthorized) — check GITLOOM_API_KEY."}
+	case http.StatusForbidden:
+		return &APIError{Status: status, Code: "unauthorized",
+			Message: "The API key was not accepted (403 Forbidden) — check GITLOOM_API_KEY, or whether the key has been revoked."}
+	}
+	e := &APIError{Status: status, Code: fmt.Sprintf("http_%d", status), Message: http.StatusText(status)}
+	var msg string
+	text := strings.TrimSpace(string(raw))
+	switch {
+	case json.Unmarshal(obj["message"], &msg) == nil && msg != "":
+		e.Message = msg
+	case text != "" && text != "null":
+		if r := []rune(text); len(r) > 300 {
+			text = string(r[:300]) + "…"
 		}
+		e.Message = text
 	}
 	return e
 }

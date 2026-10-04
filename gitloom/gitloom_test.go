@@ -305,15 +305,87 @@ func TestEditForksAndSwitches(t *testing.T) {
 	}
 }
 
-func TestAPIErrorBothShapes(t *testing.T) {
-	for _, tc := range []struct{ body, wantCode, wantMsg string }{
-		{`{"error":{"code":"quota_exceeded","message":"limit reached"}}`, "quota_exceeded", "limit reached"},
-		{`{"error":"memory unavailable"}`, "http_error", "memory unavailable"},
+// The error contract every GitLoom SDK shares. The gateway in front of the API
+// refuses a bad or missing key itself, with no envelope.
+func TestAPIErrorContract(t *testing.T) {
+	long := strings.Repeat("x", 400)
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		wantCode string
+		wantMsg  string
+	}{
+		{"envelope", 429, `{"error":{"code":"quota_exceeded","message":"limit reached"}}`, "quota_exceeded", "limit reached"},
+		{"gateway 403", 403, `{"message":"Forbidden"}`, "unauthorized",
+			"The API key was not accepted (403 Forbidden) — check GITLOOM_API_KEY, or whether the key has been revoked."},
+		{"gateway 401", 401, `{"message":"Unauthorized"}`, "unauthorized",
+			"No API key was accepted (401 Unauthorized) — check GITLOOM_API_KEY."},
+		{"enveloped 403", 403, `{"error":{"code":"dashboard_only","message":"keys are managed from the dashboard"}}`,
+			"dashboard_only", "keys are managed from the dashboard"},
+		{"gateway message", 429, `{"message":"Too Many Requests"}`, "http_429", "Too Many Requests"},
+		{"text 500", 500, "  upstream connect error\n", "http_500", "upstream connect error"},
+		{"JSON null 500", 500, "null", "http_500", "Internal Server Error"},
+		{"JSON array 502", 502, `["a"]`, "http_502", `["a"]`},
+		{"flat error string", 500, `{"error":"memory unavailable"}`, "http_500", `{"error":"memory unavailable"}`},
+		{"empty 503", 503, "", "http_503", "Service Unavailable"},
+		{"long text", 500, long, "http_500", long[:300] + "…"},
 	} {
-		e := apiErrorFrom(429, []byte(tc.body))
-		if e.Code != tc.wantCode || e.Message != tc.wantMsg {
-			t.Fatalf("%s -> %+v", tc.body, e)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(tc.status)
+			w.Write([]byte(tc.body))
+		}))
+		c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+		_, err := c.Recall(context.Background(), "x", nil)
+		srv.Close()
+		var api *APIError
+		if !errors.As(err, &api) {
+			t.Errorf("%s: err = %v, want *APIError", tc.name, err)
+			continue
 		}
+		if api.Status != tc.status || api.Code != tc.wantCode || api.Message != tc.wantMsg {
+			t.Errorf("%s: got %d %q %q, want %d %q %q", tc.name, api.Status, api.Code, api.Message,
+				tc.status, tc.wantCode, tc.wantMsg)
+		}
+	}
+}
+
+func TestMissingKeyFailsBeforeAnyRequest(t *testing.T) {
+	t.Setenv("GITLOOM_API_KEY", "")
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true }))
+	defer srv.Close()
+	c := New("", WithBaseURL(srv.URL))
+
+	_, err := c.Recall(context.Background(), "x", nil)
+	var api *APIError
+	if !errors.As(err, &api) || api.Code != "missing_api_key" || api.Status != 0 ||
+		api.Message != "No API key. Pass one to gitloom.New or set GITLOOM_API_KEY." {
+		t.Errorf("err = %v", err)
+	}
+	if err := c.Write(context.Background(), []NewMemory{{Path: "facts/a.md", Content: "a"}}, nil); !errors.As(err, &api) {
+		t.Errorf("Write: err = %v", err)
+	}
+	if called {
+		t.Error("a request went out without a key")
+	}
+
+	t.Setenv("GITLOOM_API_KEY", "gl_env")
+	if New("").apiKey != "gl_env" {
+		t.Error("an empty key should fall back to GITLOOM_API_KEY")
+	}
+}
+
+// A transport failure is not a refusal from the API: it stays the wrapped
+// cause, so errors.Is still finds it.
+func TestTransportErrorsKeepTheirCause(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c := New("k", WithBaseURL("http://127.0.0.1:1"))
+	_, err := c.Recall(ctx, "x", nil)
+	var api *APIError
+	if !errors.Is(err, context.Canceled) || errors.As(err, &api) {
+		t.Errorf("err = %v", err)
 	}
 }
 
