@@ -20,7 +20,8 @@
   `UpdatedAt`, `OccurredAt` and `ExpiresAt` as `time.Time`, zero when absent,
   with `OccurredSource` and `OccurredPrecision`. The `Created` and `Updated`
   strings remain, deprecated. A `Memory` marshals back to the API's shape, so
-  a result kept as JSON reads back.
+  a result kept as JSON reads back. `StoredMemory`, what `Get` returns,
+  carries the same.
 - **`RecallOptions` takes `Rank`, `MaxChars` and `Model`**, for `Recall` and
   `Answer` alike. `Rank` (`RankFused` or `RankJev`) retrieves on the lane
   path, which also reaches conversation turns and the dates in a question;

@@ -164,11 +164,49 @@ type StoredMemory struct {
 	Kind       string   `json:"kind,omitempty"`
 	Content    string   `json:"content"`
 	Tags       []string `json:"tags,omitempty"`
+	UserTags   []string `json:"user_tags,omitempty"`
 	Confidence float64  `json:"confidence,omitempty"`
 	Cues       []string `json:"cues,omitempty"`
 	Related    []string `json:"related,omitempty"`
-	Created    string   `json:"created,omitempty"`
-	Updated    string   `json:"updated,omitempty"`
+
+	// The times read as Memory's do.
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	OccurredAt        time.Time `json:"occurred_at"`
+	ExpiresAt         time.Time `json:"expires_at"`
+	OccurredSource    string    `json:"occurred_source,omitempty"`
+	OccurredPrecision string    `json:"occurred_precision,omitempty"`
+
+	// Deprecated: use CreatedAt.
+	Created string `json:"created,omitempty"`
+	// Deprecated: use UpdatedAt.
+	Updated string `json:"updated,omitempty"`
+}
+
+type storedFields StoredMemory
+
+type storedWire struct {
+	storedFields
+	CreatedAt  int64 `json:"created_at,omitempty"`
+	UpdatedAt  int64 `json:"updated_at,omitempty"`
+	OccurredAt int64 `json:"occurred_at,omitempty"`
+	ExpiresAt  int64 `json:"expires_at,omitempty"`
+}
+
+func (m StoredMemory) MarshalJSON() ([]byte, error) {
+	return json.Marshal(storedWire{storedFields(m),
+		unixOf(m.CreatedAt), unixOf(m.UpdatedAt), unixOf(m.OccurredAt), unixOf(m.ExpiresAt)})
+}
+
+func (m *StoredMemory) UnmarshalJSON(b []byte) error {
+	var w storedWire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	*m = StoredMemory(w.storedFields)
+	m.CreatedAt, m.UpdatedAt = fromUnix(w.CreatedAt), fromUnix(w.UpdatedAt)
+	m.OccurredAt, m.ExpiresAt = fromUnix(w.OccurredAt), fromUnix(w.ExpiresAt)
+	return nil
 }
 
 // Get reads one memory by path — a file, or a file.md#section. This is what

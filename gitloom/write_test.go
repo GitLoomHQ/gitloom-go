@@ -319,3 +319,55 @@ func TestWriteSurfacesARefusedTag(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 }
+
+func TestGetReadsTagsAndTimes(t *testing.T) {
+	devBody := `{"confidence":0,"content":"…","created":"2026-10-04T13:33:23Z","created_at":1791120803,"kind":"file","millis":0,"namespace":"x","occurred_at":1772712000,"occurred_precision":"day","occurred_source":"user","path":"facts/test/a.md","tags":["home","lease"],"tier":"facts","title":"","updated":"2026-10-04T13:33:23Z","updated_at":1791120803,"user_tags":["home","lease"]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("path") == "facts/test/untagged.md" {
+			w.Write([]byte(`{"namespace":"x","path":"facts/test/untagged.md","content":"b","tags":null,"user_tags":null,"created_at":1791120803}`))
+			return
+		}
+		w.Write([]byte(devBody))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("x"))
+	ctx := context.Background()
+
+	m, err := c.Get(ctx, "facts/test/a.md", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written := time.Date(2026, 10, 4, 13, 33, 23, 0, time.UTC)
+	if !m.CreatedAt.Equal(written) || !m.UpdatedAt.Equal(written) || m.CreatedAt.Location() != time.UTC {
+		t.Errorf("created %v updated %v, want %v", m.CreatedAt, m.UpdatedAt, written)
+	}
+	if m.OccurredAt.Format(time.DateOnly) != "2026-03-05" || m.OccurredPrecision != "day" || m.OccurredSource != "user" {
+		t.Errorf("occurred %v %q %q", m.OccurredAt, m.OccurredPrecision, m.OccurredSource)
+	}
+	if strings.Join(m.UserTags, ",") != "home,lease" || strings.Join(m.Tags, ",") != "home,lease" || !m.ExpiresAt.IsZero() {
+		t.Errorf("memory = %+v", m)
+	}
+	if m.Created != "2026-10-04T13:33:23Z" || m.Kind != "file" || m.Tier != "facts" {
+		t.Errorf("memory = %+v", m)
+	}
+
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back StoredMemory
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.OccurredAt.Equal(m.OccurredAt) || !back.CreatedAt.Equal(written) || back.OccurredPrecision != "day" {
+		t.Errorf("round trip %s = %+v", b, back)
+	}
+
+	bare, err := c.Get(ctx, "facts/test/untagged.md", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bare.Tags != nil || bare.UserTags != nil || !bare.CreatedAt.Equal(written) || !bare.OccurredAt.IsZero() {
+		t.Errorf("untagged = %+v", bare)
+	}
+}
