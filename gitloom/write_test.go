@@ -363,6 +363,14 @@ func TestGetReadsTagsAndTimes(t *testing.T) {
 		t.Errorf("round trip %s = %+v", b, back)
 	}
 
+	var iso StoredMemory
+	if err := json.Unmarshal([]byte(`{"path":"facts/test/a.md","created_at":"2026-10-04T19:03:23+05:30","occurred_at":"2026-03-05T12:00:00Z","expires_at":null}`), &iso); err != nil {
+		t.Fatal(err)
+	}
+	if !iso.CreatedAt.Equal(written) || !iso.OccurredAt.Equal(m.OccurredAt) || !iso.ExpiresAt.IsZero() {
+		t.Errorf("iso = %+v", iso)
+	}
+
 	bare, err := c.Get(ctx, "facts/test/untagged.md", nil)
 	if err != nil {
 		t.Fatal(err)

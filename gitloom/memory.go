@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -83,15 +85,15 @@ type memoryFields Memory
 // memoryWire is Memory as the API sends it. Its times shadow Memory's.
 type memoryWire struct {
 	memoryFields
-	CreatedAt  int64 `json:"created_at,omitempty"`
-	UpdatedAt  int64 `json:"updated_at,omitempty"`
-	OccurredAt int64 `json:"occurred_at,omitempty"`
-	ExpiresAt  int64 `json:"expires_at,omitempty"`
+	CreatedAt  wireTime `json:"created_at,omitzero"`
+	UpdatedAt  wireTime `json:"updated_at,omitzero"`
+	OccurredAt wireTime `json:"occurred_at,omitzero"`
+	ExpiresAt  wireTime `json:"expires_at,omitzero"`
 }
 
 func (m Memory) MarshalJSON() ([]byte, error) {
 	return json.Marshal(memoryWire{memoryFields(m),
-		unixOf(m.CreatedAt), unixOf(m.UpdatedAt), unixOf(m.OccurredAt), unixOf(m.ExpiresAt)})
+		wireTime(m.CreatedAt), wireTime(m.UpdatedAt), wireTime(m.OccurredAt), wireTime(m.ExpiresAt)})
 }
 
 func (m *Memory) UnmarshalJSON(b []byte) error {
@@ -100,23 +102,47 @@ func (m *Memory) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*m = Memory(w.memoryFields)
-	m.CreatedAt, m.UpdatedAt = fromUnix(w.CreatedAt), fromUnix(w.UpdatedAt)
-	m.OccurredAt, m.ExpiresAt = fromUnix(w.OccurredAt), fromUnix(w.ExpiresAt)
+	m.CreatedAt, m.UpdatedAt = time.Time(w.CreatedAt), time.Time(w.UpdatedAt)
+	m.OccurredAt, m.ExpiresAt = time.Time(w.OccurredAt), time.Time(w.ExpiresAt)
 	return nil
 }
 
-func unixOf(t time.Time) int64 {
-	if t.IsZero() {
-		return 0
-	}
-	return t.Unix()
+// wireTime is a memory time as the API sends it: unix seconds, or RFC 3339
+// under time_format=iso. It decodes to UTC and encodes as unix seconds.
+type wireTime time.Time
+
+func (w wireTime) IsZero() bool { return time.Time(w).IsZero() }
+
+func (w wireTime) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.FormatInt(time.Time(w).Unix(), 10)), nil
 }
 
-func fromUnix(s int64) time.Time {
-	if s == 0 {
-		return time.Time{}
+func (w *wireTime) UnmarshalJSON(b []byte) error {
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
 	}
-	return time.Unix(s, 0).UTC()
+	switch v := v.(type) {
+	case nil:
+		*w = wireTime{}
+	case float64:
+		*w = wireTime{}
+		if s := int64(math.Floor(v)); s != 0 {
+			*w = wireTime(time.Unix(s, 0).UTC())
+		}
+	case string:
+		*w = wireTime{}
+		if v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				return fmt.Errorf("gitloom: time %q is not RFC 3339: %w", v, err)
+			}
+			*w = wireTime(t.UTC())
+		}
+	default:
+		return fmt.Errorf("gitloom: a time is unix seconds or RFC 3339, not %s", b)
+	}
+	return nil
 }
 
 type Scores struct {

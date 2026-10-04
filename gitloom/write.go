@@ -187,15 +187,15 @@ type storedFields StoredMemory
 
 type storedWire struct {
 	storedFields
-	CreatedAt  int64 `json:"created_at,omitempty"`
-	UpdatedAt  int64 `json:"updated_at,omitempty"`
-	OccurredAt int64 `json:"occurred_at,omitempty"`
-	ExpiresAt  int64 `json:"expires_at,omitempty"`
+	CreatedAt  wireTime `json:"created_at,omitzero"`
+	UpdatedAt  wireTime `json:"updated_at,omitzero"`
+	OccurredAt wireTime `json:"occurred_at,omitzero"`
+	ExpiresAt  wireTime `json:"expires_at,omitzero"`
 }
 
 func (m StoredMemory) MarshalJSON() ([]byte, error) {
 	return json.Marshal(storedWire{storedFields(m),
-		unixOf(m.CreatedAt), unixOf(m.UpdatedAt), unixOf(m.OccurredAt), unixOf(m.ExpiresAt)})
+		wireTime(m.CreatedAt), wireTime(m.UpdatedAt), wireTime(m.OccurredAt), wireTime(m.ExpiresAt)})
 }
 
 func (m *StoredMemory) UnmarshalJSON(b []byte) error {
@@ -204,8 +204,8 @@ func (m *StoredMemory) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*m = StoredMemory(w.storedFields)
-	m.CreatedAt, m.UpdatedAt = fromUnix(w.CreatedAt), fromUnix(w.UpdatedAt)
-	m.OccurredAt, m.ExpiresAt = fromUnix(w.OccurredAt), fromUnix(w.ExpiresAt)
+	m.CreatedAt, m.UpdatedAt = time.Time(w.CreatedAt), time.Time(w.UpdatedAt)
+	m.OccurredAt, m.ExpiresAt = time.Time(w.OccurredAt), time.Time(w.ExpiresAt)
 	return nil
 }
 
