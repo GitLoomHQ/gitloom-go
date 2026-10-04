@@ -319,8 +319,8 @@ type RecallOptions struct {
 	// TZ is the IANA zone, e.g. "Asia/Kolkata", the server reads offset-less
 	// times and bare dates in when since and until arrive as text. Since and
 	// Until go as UTC instants, so TZ never changes the range; it is sent for
-	// parity, and only a server with TIMEZONES on otherwise reads it, for
-	// dates in the question.
+	// parity, and is otherwise read only where the server reads question dates
+	// by zone.
 	TZ string
 
 	// MinScore drops memories below this relevance. NoContext drops graph

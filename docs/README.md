@@ -111,8 +111,8 @@ query nor a filter, `Recall` returns `ErrNoQuery` without calling the API.
 `TimeUpdated` (the default). `TZ` is the IANA zone the server reads
 offset-less times and bare dates in, for `since` and `until` sent as text.
 `Since` and `Until` always go as UTC instants, so `TZ` never changes the range;
-it is sent for parity, and only a server with its `TIMEZONES` flag on otherwise
-reads it, for dates in the question.
+it is sent for parity, and is otherwise used only where the server reads
+question dates by zone.
 
 ### The lane path
 
