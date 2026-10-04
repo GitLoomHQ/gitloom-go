@@ -108,8 +108,11 @@ query nor a filter, `Recall` returns `ErrNoQuery` without calling the API.
 
 `TimeField` picks the time `Since` and `Until` bound, and orders the listing:
 `TimeOccurred` (when the memory's subject happened), `TimeCreated`, or
-`TimeUpdated` (the default). `TZ` is the IANA zone dates in a question, like
-"last month", are read in.
+`TimeUpdated` (the default). `TZ` is the IANA zone the server reads
+offset-less times and bare dates in, for `since` and `until` sent as text.
+`Since` and `Until` always go as UTC instants, so `TZ` never changes the range;
+it is sent for parity, and only a server with its `TIMEZONES` flag on otherwise
+reads it, for dates in the question.
 
 ### The lane path
 

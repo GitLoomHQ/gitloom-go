@@ -14,7 +14,8 @@
   `ErrNoQuery` without calling the API, where it used to come back as a 400.
 - **`RecallOptions.TimeField` and `TZ`.** `TimeField` (`TimeOccurred`,
   `TimeCreated` or `TimeUpdated`) picks the time `Since` and `Until` bound and
-  orders a listing; `TZ` is the zone dates in a question are read in.
+  orders a listing. `TZ` is sent for parity: `Since` and `Until` go as UTC
+  instants, so it never changes the range.
 - **Memory times.** A `Memory` carries `UserTags`, and `CreatedAt`,
   `UpdatedAt`, `OccurredAt` and `ExpiresAt` as `time.Time`, zero when absent,
   with `OccurredSource` and `OccurredPrecision`. The `Created` and `Updated`
