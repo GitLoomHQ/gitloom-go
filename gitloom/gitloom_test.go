@@ -602,6 +602,151 @@ func TestAnswerPassesTheLanePathThrough(t *testing.T) {
 	}
 }
 
+// A tag may hold a # or a space, and an unencoded # ends the query string, so
+// the server would see a filter that names no tag.
+func TestRecallSendsTheTimeFilterAndEncodesTags(t *testing.T) {
+	r, c := newRecorder(t, map[string]any{"memories": []any{}})
+	ist := time.FixedZone("IST", 5*3600+1800)
+
+	if _, err := c.Recall(context.Background(), "where did we travel", &RecallOptions{
+		Tags: []string{"#work", "q3 plan"}, TagsAll: []string{"@maya"},
+		Since:     time.Date(2026, 5, 1, 0, 0, 0, 0, ist),
+		Until:     time.Date(2026, 5, 31, 23, 59, 59, 0, time.UTC),
+		TimeField: TimeOccurred, TZ: "Asia/Kolkata",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(r.query, "#") || !strings.Contains(r.query, "tags=%23work%2Cq3+plan") ||
+		!strings.Contains(r.query, "tags_all=%40maya") {
+		t.Errorf("raw query = %s", r.query)
+	}
+	q, _ := url.ParseQuery(r.query)
+	for key, want := range map[string]string{
+		"tags": "#work,q3 plan", "since": "2026-04-30T18:30:00Z", "until": "2026-05-31T23:59:59Z",
+		"time_field": "occurred", "tz": "Asia/Kolkata", "q": "where did we travel",
+	} {
+		if q.Get(key) != want {
+			t.Errorf("%s = %q, want %q", key, q.Get(key), want)
+		}
+	}
+}
+
+// Any one filter is enough to list without a question, and the question is
+// then left off the wire rather than sent empty.
+func TestRecallListsByFilterWithoutAQuery(t *testing.T) {
+	day := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	for name, o := range map[string]RecallOptions{
+		"tags": {Tags: []string{"lease"}}, "tags_all": {TagsAll: []string{"lease"}},
+		"since": {Since: day}, "until": {Until: day},
+		"tiers": {Tiers: []string{"facts"}}, "paths": {Paths: []string{"facts/home"}},
+	} {
+		r, c := newRecorder(t, map[string]any{"mode": "raw", "memories": []map[string]any{
+			{"path": "facts/home/lease.md", "content": "The lease renews in March.", "score": 1},
+		}})
+		res, err := c.Recall(context.Background(), "", &o)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		q, _ := url.ParseQuery(r.query)
+		if _, sent := q["q"]; sent || q.Get(name) == "" {
+			t.Errorf("%s: query = %s", name, r.query)
+		}
+		if len(res.Memories) != 1 || res.Memories[0].Score != 1 {
+			t.Errorf("%s: memories = %+v", name, res.Memories)
+		}
+	}
+}
+
+func TestRecallWithNeitherQueryNorFilterFailsBeforeCalling(t *testing.T) {
+	r, c := newRecorder(t, nil)
+	ctx := context.Background()
+	for _, o := range []*RecallOptions{nil, {Limit: 5, TimeField: TimeOccurred, TZ: "Asia/Kolkata", MinScore: 0.3}} {
+		if _, err := c.Recall(ctx, "  ", o); !errors.Is(err, ErrNoQuery) {
+			t.Errorf("err = %v, want ErrNoQuery", err)
+		}
+	}
+	if _, err := c.Context(ctx, "", nil); !errors.Is(err, ErrNoQuery) {
+		t.Errorf("Context: err = %v, want ErrNoQuery", err)
+	}
+	if r.method != "" {
+		t.Error("the request was sent")
+	}
+}
+
+func TestRecallReadsTagsAndTimes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"namespace":"ns","mode":"raw","memories":[
+			{"path":"facts/gear/a7iii.md","content":"Bought a Sony A7III.","score":0.93,"matched":["lexical"],
+				"tags":["gear","camera"],"user_tags":["gear"],"created":"2026-07-31T10:02:11Z",
+				"created_at":1785492131,"updated_at":1785492131,"occurred_at":1785499200,
+				"occurred_source":"user","occurred_precision":"day","expires_at":1788091200},
+			{"path":"facts/b.md","content":"b","score":0.5,"matched":["cue"]}]}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	res, err := c.Recall(context.Background(), "what camera", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := res.Memories[0]
+	if m.UserTags[0] != "gear" || m.Tags[1] != "camera" || m.Created != "2026-07-31T10:02:11Z" {
+		t.Errorf("memory = %+v", m)
+	}
+	if want := time.Date(2026, 7, 31, 10, 2, 11, 0, time.UTC); !m.CreatedAt.Equal(want) || !m.UpdatedAt.Equal(want) {
+		t.Errorf("created %v updated %v, want %v", m.CreatedAt, m.UpdatedAt, want)
+	}
+	if m.OccurredAt.Format(time.DateOnly) != "2026-07-31" || m.OccurredAt.Location() != time.UTC ||
+		m.OccurredSource != "user" || m.OccurredPrecision != "day" {
+		t.Errorf("occurred %v %q %q", m.OccurredAt, m.OccurredSource, m.OccurredPrecision)
+	}
+	if m.ExpiresAt.Unix() != 1788091200 {
+		t.Errorf("expires %v", m.ExpiresAt)
+	}
+	bare := res.Memories[1]
+	if !bare.CreatedAt.IsZero() || !bare.OccurredAt.IsZero() || !bare.ExpiresAt.IsZero() {
+		t.Errorf("absent times must be zero: %+v", bare)
+	}
+
+	// A result kept as JSON must read back as it was sent.
+	b, err := json.Marshal(res.Memories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw []map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, sent := raw[1]["created_at"]; sent || raw[0]["occurred_at"] != float64(1785499200) {
+		t.Errorf("marshalled %s", b)
+	}
+	var back []Memory
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back[0].OccurredAt.Equal(m.OccurredAt) || !back[1].CreatedAt.IsZero() {
+		t.Errorf("round trip = %+v", back)
+	}
+}
+
+func TestRecallSurfacesAFilterRefusal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"code":"invalid_date","message":"since is after until"}}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	_, err := c.Recall(context.Background(), "", &RecallOptions{
+		Since: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), Until: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+	})
+	var api *APIError
+	if !errors.As(err, &api) || api.Code != "invalid_date" || api.Message != "since is after until" {
+		t.Errorf("err = %v", err)
+	}
+}
+
 // An empty answer must be an error rather than an empty string a caller shows
 // to a user.
 func TestAnswerRefusesToReturnNothing(t *testing.T) {

@@ -2,10 +2,13 @@ package gitloom
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The direct memory primitives.
@@ -25,8 +28,11 @@ type NewMemory struct {
 	Path string `json:"path"`
 	// Content is markdown. Its ## headers become separately addressable
 	// sub-nodes, so retrieval can point at a section rather than a whole file.
-	Content string   `json:"content"`
-	Tags    []string `json:"tags,omitempty"`
+	Content string `json:"content"`
+	// Tags are trimmed and lowercased by the server: letters, digits, spaces
+	// and - _ . : / # @, at most 32 of 64 characters. One that breaks the
+	// rules refuses the whole write with an *APIError coded "invalid_tag".
+	Tags []string `json:"tags,omitempty"`
 	// Confidence in [0,1]. Retrieval uses it to break ties between memories
 	// that contradict each other.
 	Confidence float64 `json:"confidence,omitempty"`
@@ -35,9 +41,13 @@ type NewMemory struct {
 	// Supersedes names a memory this one replaces, so an update wins over what
 	// it contradicts instead of both being returned.
 	Supersedes string `json:"supersedes,omitempty"`
-	// Date is what the memory is ABOUT (YYYY-MM-DD), not when it was written.
-	// Backfilling last year's facts without it stamps them all with today and
-	// destroys every recency judgement retrieval makes.
+	// OccurredAt is when what the memory is ABOUT happened, not when it was
+	// written. Backfilling last year's facts without it stamps them all with
+	// today and destroys every recency judgement retrieval makes.
+	OccurredAt When `json:"occurred_at,omitzero"`
+	// Date is OccurredAt as YYYY-MM-DD.
+	//
+	// Deprecated: use OccurredAt, which wins when both are set.
 	Date string `json:"date,omitempty"`
 	// Cues are 2-5 short phrasings of how someone would later ASK for this.
 	// They are embedded for semantic search, and they are the difference
@@ -49,9 +59,70 @@ type NewMemory struct {
 	Related []string `json:"related,omitempty"`
 }
 
+// When is a time as a write sends it. At and Unix send an instant, Day a
+// calendar day, and Date text for the server to read. The zero When is unset.
+type When struct {
+	t    time.Time
+	text string
+}
+
+// At is the instant t.
+func At(t time.Time) When { return When{t: t} }
+
+// Unix is the instant sec seconds after the Unix epoch.
+func Unix(sec int64) When { return When{t: time.Unix(sec, 0)} }
+
+// Day is a calendar day, with no time of day: the server keeps it as that
+// date wherever it is read.
+func Day(year int, month time.Month, day int) When {
+	return When{text: time.Date(year, month, day, 0, 0, 0, 0, time.UTC).Format(time.DateOnly)}
+}
+
+// Date is s as the server reads it: a date "2026-07-19", RFC 3339 with an
+// offset, or a datetime without one, read in the write's Timezone.
+func Date(s string) When { return When{text: s} }
+
+func (w When) IsZero() bool { return w.t.IsZero() && w.text == "" }
+
+func (w When) MarshalJSON() ([]byte, error) {
+	switch {
+	case w.text != "":
+		return json.Marshal(w.text)
+	case w.t.IsZero():
+		return []byte("null"), nil
+	}
+	// The server reads a bare number as epoch seconds only at 9 to 11 digits,
+	// so anything before March 1973 goes as RFC 3339 instead.
+	if s := w.t.Unix(); s >= 1e8 && s < 1e11 {
+		return []byte(strconv.FormatInt(s, 10)), nil
+	}
+	return json.Marshal(w.t.UTC().Format(time.RFC3339))
+}
+
+func (w *When) UnmarshalJSON(b []byte) error {
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	switch v := v.(type) {
+	case nil:
+		*w = When{}
+	case string:
+		*w = Date(v)
+	case float64:
+		*w = Unix(int64(math.Floor(v)))
+	default:
+		return fmt.Errorf("gitloom: a time is a string or epoch seconds, not %s", b)
+	}
+	return nil
+}
+
 // WriteOptions shape one direct write.
 type WriteOptions struct {
 	Namespace string
+	// Timezone is the IANA zone a memory's OccurredAt is read in when it is a
+	// datetime without an offset. Empty means UTC.
+	Timezone string
 }
 
 // Write stores already-formed memories. Asynchronous, like Remember: the write
@@ -65,17 +136,23 @@ func (c *Client) Write(ctx context.Context, memories []NewMemory, opts *WriteOpt
 	if len(memories) == 0 {
 		return nil
 	}
-	ns := c.namespace
-	if opts != nil && opts.Namespace != "" {
-		ns = opts.Namespace
+	o := WriteOptions{}
+	if opts != nil {
+		o = *opts
+	}
+	if o.Namespace == "" {
+		o.Namespace = c.namespace
 	}
 	for i, m := range memories {
 		if !strings.HasSuffix(m.Path, ".md") {
 			return fmt.Errorf("gitloom: memory %d: path %q must end in .md", i, m.Path)
 		}
 	}
-	return c.request(ctx, "POST", "/v1/memories",
-		map[string]any{"namespace": ns, "memories": memories}, nil)
+	body := map[string]any{"namespace": o.Namespace, "memories": memories}
+	if o.Timezone != "" {
+		body["timezone"] = o.Timezone
+	}
+	return c.request(ctx, "POST", "/v1/memories", body, nil)
 }
 
 // StoredMemory is one memory read back by path.
