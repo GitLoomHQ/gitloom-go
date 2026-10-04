@@ -4,11 +4,13 @@
 
 ### Breaking
 
-- **`http_error` becomes `http_<status>`.** An error response without the
-  API's `{"error":{code,message}}` envelope is coded `http_429`, `http_500`
-  and so on. Its message is a flat `{"error":"..."}`'s text, else the body's
-  `message`, else its text up to 300 characters, else the status text.
-- **`unauthorized`.** A 401 or 403 without an envelope, which is the gateway
+- **`http_error` becomes `http_<status>`.** An error response whose body
+  names no code is coded `http_429`, `http_500` and so on. Any `error` object
+  is the API's envelope: its `code` and `message` win, each falling back to
+  `http_<status>` and the status text. Without one, the message is a flat
+  `{"error":"..."}`'s text, else the body's `message`, else its text up to
+  300 characters, else the status text.
+- **`unauthorized`.** A 401 or 403 with no `error` object, which is the gateway
   refusing a missing or bad key, is coded `unauthorized`, with a message
   pointing at `GITLOOM_API_KEY` or the key passed to the client. Before, it
   was `http_error` with the gateway's body.
@@ -50,8 +52,9 @@
   a result kept as JSON reads back. `StoredMemory`, what `Get` returns,
   carries the same. Times read from unix seconds or, should a response carry
   them so, RFC 3339; the SDK never asks for `time_format`.
-- **`APIError.RetryAfter`** holds a 429's `Retry-After`, zero when there is
-  none. Nothing is retried for you.
+- **`APIError.RetryAfter`** holds a 429's `Retry-After` in delta-seconds,
+  digits only, and is zero when there is none, or it is a date or signed.
+  Nothing is retried for you.
 - **Network failures say so.** They stay the wrapped cause, not an
   `*APIError`, and read `gitloom: timed out:`, `gitloom: canceled:` or
   `gitloom: network error:`. The README's Errors section says how to tell

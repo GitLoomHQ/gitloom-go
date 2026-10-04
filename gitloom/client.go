@@ -129,9 +129,7 @@ func (c *Client) request(ctx context.Context, method, path string, body, out any
 	if res.StatusCode >= 400 {
 		e := apiErrorFrom(res.StatusCode, raw)
 		if res.StatusCode == http.StatusTooManyRequests {
-			if n, err := strconv.Atoi(strings.TrimSpace(res.Header.Get("Retry-After"))); err == nil && n >= 0 {
-				e.RetryAfter = time.Duration(n) * time.Second
-			}
+			e.RetryAfter = retryAfter(res.Header.Get("Retry-After"))
 		}
 		return e
 	}
@@ -157,22 +155,39 @@ func transportError(err error) error {
 	return fmt.Errorf("gitloom: network error: %w", err)
 }
 
+// retryAfter reads Retry-After as delta-seconds, digits only; an HTTP date or
+// a signed number is zero.
+func retryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" || strings.Trim(h, "0123456789") != "" {
+		return 0
+	}
+	n, err := strconv.Atoi(h)
+	if err != nil {
+		return 0
+	}
+	return time.Duration(n) * time.Second
+}
+
 // apiErrorFrom reads an error response. The API answers with the envelope
-// {"error":{"code","message"}}, and once answered with a flat {"error":"..."};
+// {"error":{"code","message"}}, either part of which may be missing, and once
+// answered with a flat {"error":"..."};
 // the gateway in front of it answers a refused or missing key with a bare
 // {"message"}, and anything else may be text.
 func apiErrorFrom(status int, raw []byte) *APIError {
 	var obj map[string]json.RawMessage
 	_ = json.Unmarshal(raw, &obj)
-	var env struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	}
-	if json.Unmarshal(obj["error"], &env) == nil && env.Code != "" {
-		if env.Message == "" {
-			env.Message = http.StatusText(status)
+	e := &APIError{Status: status, Code: fmt.Sprintf("http_%d", status), Message: http.StatusText(status)}
+	var env map[string]json.RawMessage
+	if json.Unmarshal(obj["error"], &env) == nil && env != nil {
+		var code, msg string
+		if json.Unmarshal(env["code"], &code) == nil && code != "" {
+			e.Code = code
 		}
-		return &APIError{Status: status, Code: env.Code, Message: env.Message}
+		if json.Unmarshal(env["message"], &msg) == nil && msg != "" {
+			e.Message = msg
+		}
+		return e
 	}
 	switch status {
 	case http.StatusUnauthorized:
@@ -182,7 +197,6 @@ func apiErrorFrom(status int, raw []byte) *APIError {
 		return &APIError{Status: status, Code: "unauthorized",
 			Message: "The API key was not accepted (403 Forbidden) — check the API key (GITLOOM_API_KEY, or the key passed to the client), or whether it has been revoked."}
 	}
-	e := &APIError{Status: status, Code: fmt.Sprintf("http_%d", status), Message: http.StatusText(status)}
 	var flat, msg string
 	text := strings.TrimSpace(string(raw))
 	switch {

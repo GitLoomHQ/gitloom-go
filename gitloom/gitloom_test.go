@@ -325,6 +325,13 @@ func TestAPIErrorContract(t *testing.T) {
 			"No API key was accepted (401 Unauthorized) — check the API key (GITLOOM_API_KEY, or the key passed to the client)."},
 		{"enveloped 403", 403, `{"error":{"code":"dashboard_only","message":"keys are managed from the dashboard"}}`,
 			"dashboard_only", "keys are managed from the dashboard"},
+		{"envelope without a code", 500, `{"error":{"message":"boom"}}`, "http_500", "boom"},
+		{"envelope without a code on a 403", 403, `{"error":{"message":"boom"}}`, "http_403", "boom"},
+		{"envelope without a message", 409, `{"error":{"code":"conflict"}}`, "conflict", "Conflict"},
+		{"empty envelope", 500, `{"error":{}}`, "http_500", "Internal Server Error"},
+		{"envelope with a numeric code", 500, `{"error":{"code":5,"message":"boom"}}`, "http_500", "boom"},
+		{"null envelope on a 403", 403, `{"error":null,"message":"Forbidden"}`, "unauthorized",
+			"The API key was not accepted (403 Forbidden) — check the API key (GITLOOM_API_KEY, or the key passed to the client), or whether it has been revoked."},
 		{"gateway message", 429, `{"message":"Too Many Requests"}`, "http_429", "Too Many Requests"},
 		{"text 500", 500, "  upstream connect error\n", "http_500", "upstream connect error"},
 		{"JSON null 500", 500, "null", "http_500", "Internal Server Error"},
@@ -555,6 +562,7 @@ func TestRateLimitCarriesRetryAfter(t *testing.T) {
 
 	for header, want := range map[string]time.Duration{
 		"7": 7 * time.Second, "none": 0, "Wed, 21 Oct 2026 07:28:00 GMT": 0, "-3": 0,
+		"+30": 0, "1.5": 0, "0": 0, "120": 2 * time.Minute,
 	} {
 		_, err := c.Recall(context.Background(), header, nil)
 		var api *APIError
@@ -564,8 +572,8 @@ func TestRateLimitCarriesRetryAfter(t *testing.T) {
 			t.Errorf("Retry-After %q: RetryAfter = %v, want %v", header, api.RetryAfter, want)
 		}
 	}
-	if hits.Load() != 4 {
-		t.Errorf("%d requests for 4 calls; a 429 must not be retried", hits.Load())
+	if hits.Load() != 8 {
+		t.Errorf("%d requests for 8 calls; a 429 must not be retried", hits.Load())
 	}
 }
 
