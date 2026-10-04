@@ -90,6 +90,27 @@ last diff, labelled relation snippets and cues.
 `Answer` meters as a chat rather than a read, and returns `ErrNoAnswer` rather
 than an empty string when the model finds nothing to say.
 
+### Listing without a question
+
+```go
+// Every memory tagged "lease" whose subject happened since March, newest first.
+leases, _ := mem.Recall(ctx, "", &gitloom.RecallOptions{
+    Tags:      []string{"lease"},
+    TimeField: gitloom.TimeOccurred,
+    Since:     time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+})
+```
+
+Leave the query empty and give at least one filter — `Tags`, `TagsAll`,
+`Since`, `Until`, `Tiers` or `Paths` — to list every memory it matches, newest
+first, each scoring 1. The mode must be raw and `Rank` unset. With neither a
+query nor a filter, `Recall` returns `ErrNoQuery` without calling the API.
+
+`TimeField` picks the time `Since` and `Until` bound, and orders the listing:
+`TimeOccurred` (when the memory's subject happened), `TimeCreated`, or
+`TimeUpdated` (the default). `TZ` is the IANA zone dates in a question, like
+"last month", are read in.
+
 ### The lane path
 
 `Rank` retrieves on the lane path: lexical, cue, body, graph and time lanes each
@@ -156,7 +177,7 @@ err := client.Write(ctx, []gitloom.NewMemory{{
     Content:    "Maya rides a bicycle to work and prefers morning meetings.",
     Tags:       []string{"people", "colleague"},
     Confidence: 0.9,
-    Date:       "2026-07-19",                       // what it's ABOUT, not now
+    OccurredAt: gitloom.Day(2026, time.July, 19),   // what it's ABOUT, not now
     Cues:       []string{"how does Maya commute"},   // embedded for semantic search
     Related:    []string{"manager: facts/people/sam.md"},
 }}, nil)
@@ -177,6 +198,57 @@ graph,_ := client.Graph(ctx, nil)
 search vocabulary. `Topics` is what you call before filing under a new topic,
 so you don't invent `facts/databases` beside an existing `facts/database`.
 `Forget` unpublishes a memory from retrieval; git keeps the history.
+
+## Tags and when it happened
+
+```go
+// Every memory drawn from this conversation carries the tags, and is dated to
+// when it happened rather than when it was sent.
+turns := []gitloom.Turn{{Role: "user", Content: "We just checked in near Gion."}}
+err = client.Remember(ctx, turns, &gitloom.RememberOptions{
+    Tags:       []string{"trip", "#japan"},
+    OccurredAt: gitloom.Date("2026-05-14T19:30"),   // read in Timezone
+    Timezone:   "Asia/Kolkata",
+})
+
+err = client.Write(ctx, []gitloom.NewMemory{{
+    Path:       "facts/travel/kyoto.md",
+    Content:    "Stayed four nights in Kyoto, at a ryokan near Gion.",
+    Tags:       []string{"trip", "#japan"},
+    OccurredAt: gitloom.At(time.Date(2026, 5, 14, 14, 0, 0, 0, time.UTC)),
+}}, nil)
+```
+
+`OccurredAt` takes `gitloom.At(t)` for an instant, sent as epoch seconds;
+`gitloom.Day(2026, time.May, 14)` for a calendar day with no time of day; or
+`gitloom.Date(s)` for text the server reads — a date, RFC 3339 with an offset,
+or a datetime without one, read in `Timezone`. The `Date` fields it replaces
+still work and are deprecated.
+
+Tags are trimmed and lowercased, and hold letters, digits, spaces and
+`- _ . : / # @` — up to 32 tags of 64 characters. One that breaks the rules
+refuses the write with an `*APIError` whose `Code` is `invalid_tag` and whose
+message names it, e.g. `memories[1].tags[0]`.
+
+Recall reports them back:
+
+```go
+res, _ := client.Recall(ctx, "where did I stay in Kyoto", nil)
+for _, m := range res.Memories {
+    when := m.OccurredAt.Format(time.RFC3339)
+    if m.OccurredPrecision == "day" {
+        when = m.OccurredAt.Format(time.DateOnly)   // only the date is known
+    }
+    fmt.Println(m.Path, m.UserTags, when, m.OccurredSource, m.UpdatedAt)
+}
+```
+
+`Tags` lists yours first, then the ones GitLoom inferred; `UserTags` holds
+yours alone. `CreatedAt`, `UpdatedAt`, `OccurredAt` and `ExpiresAt` are
+`time.Time` in UTC, zero when absent. `OccurredSource` says how the time is
+known: `user` (you said), `extracted` (the memory names the day), `said` (when
+its conversation happened) or `written`. The `Created` and `Updated` strings
+are deprecated.
 
 ## Docs
 

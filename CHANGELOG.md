@@ -1,7 +1,25 @@
 # Changelog
 
-## Unreleased
+## v0.6.0 — unreleased
 
+- **Tags and when it happened, on every write.** `NewMemory` and
+  `RememberOptions` take `OccurredAt`, a `When`: `At(t)` for an instant, sent
+  as epoch seconds; `Unix(sec)`; `Day(y, m, d)` for a calendar day; or
+  `Date(s)` for text the server reads. `RememberOptions` also takes `Tags`,
+  applied to every memory drawn from the conversation, and `Timezone`, which
+  `WriteOptions` takes too. The `Date` fields still work and are deprecated.
+- **Recall without a question.** An empty query with any filter — `Tags`,
+  `TagsAll`, `Since`, `Until`, `Tiers` or `Paths` — lists every memory it
+  matches, newest first, each scoring 1. With neither, `Recall` returns
+  `ErrNoQuery` without calling the API, where it used to come back as a 400.
+- **`RecallOptions.TimeField` and `TZ`.** `TimeField` (`TimeOccurred`,
+  `TimeCreated` or `TimeUpdated`) picks the time `Since` and `Until` bound and
+  orders a listing; `TZ` is the zone dates in a question are read in.
+- **Memory times.** A `Memory` carries `UserTags`, and `CreatedAt`,
+  `UpdatedAt`, `OccurredAt` and `ExpiresAt` as `time.Time`, zero when absent,
+  with `OccurredSource` and `OccurredPrecision`. The `Created` and `Updated`
+  strings remain, deprecated. A `Memory` marshals back to the API's shape, so
+  a result kept as JSON reads back.
 - **`RecallOptions` takes `Rank`, `MaxChars` and `Model`**, for `Recall` and
   `Answer` alike. `Rank` (`RankFused` or `RankJev`) retrieves on the lane
   path, which also reaches conversation turns and the dates in a question;
