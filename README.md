@@ -90,6 +90,55 @@ last diff, labelled relation snippets and cues.
 `Answer` meters as a chat rather than a read, and returns `ErrNoAnswer` rather
 than an empty string when the model finds nothing to say.
 
+### Listing without a question
+
+```go
+// Every memory tagged "lease" whose subject happened since March, newest first.
+leases, _ := mem.Recall(ctx, "", &gitloom.RecallOptions{
+    Tags:      []string{"lease"},
+    TimeField: gitloom.TimeOccurred,
+    Since:     time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+})
+```
+
+Leave the query empty and give at least one filter — `Tags`, `TagsAll`,
+`Since`, `Until`, `Tiers` or `Paths` — to list every memory it matches, newest
+first, each scoring 1. The mode must be raw and `Rank` unset. With neither a
+query nor a filter, `Recall` returns `ErrNoQuery` without calling the API.
+
+`TimeField` picks the time `Since` and `Until` bound, and orders the listing:
+`TimeOccurred` (when the memory's subject happened), `TimeCreated`, or
+`TimeUpdated` (the default). `TZ` is the IANA zone the server reads
+offset-less times and bare dates in, for `since` and `until` sent as text.
+`Since` and `Until` always go as UTC instants, so `TZ` never changes the range;
+it is sent for parity, and is otherwise used only where the server reads
+question dates by zone.
+
+### The lane path
+
+`Rank` retrieves on the lane path: lexical, cue, body, graph and time lanes each
+search on their own, over the curated memories and the conversation turns, and
+the time lane reads dates in the question ("last month", "in May"). `RankFused`
+orders what they find by lane score; `RankJev` has a ranking model order it, and
+sets `RankFallback` when it answers in lane order instead.
+
+```go
+res, _ := mem.Recall(ctx, "when did I stake the tomatoes",
+    &gitloom.RecallOptions{Rank: gitloom.RankFused, MaxChars: 8000})
+for _, m := range res.Memories {
+    fmt.Println(m.Store, m.Said, m.Excerpted, m.Content)
+}
+
+ans, _ := mem.Answer(ctx, "what did I plant after the storm",
+    &gitloom.RecallOptions{Rank: gitloom.RankJev, Model: gitloom.ModelSonnet})
+```
+
+Each memory then says which `Store` it came from (`"memory"`, or a word-for-word
+conversation `"turn"`) and the days it was `Said`. `MaxChars` caps the memory
+content returned: a memory that does not fit is cut to its opening sentence and
+the sentences matching the question, and marked `Excerpted`. `Model` picks the
+model that reads the memories in `ModeSummary` or `ModeAgentic`.
+
 ## Vocabulary and skills
 
 ```go
@@ -131,7 +180,7 @@ err := client.Write(ctx, []gitloom.NewMemory{{
     Content:    "Maya rides a bicycle to work and prefers morning meetings.",
     Tags:       []string{"people", "colleague"},
     Confidence: 0.9,
-    Date:       "2026-07-19",                       // what it's ABOUT, not now
+    OccurredAt: gitloom.Day(2026, time.July, 19),   // what it's ABOUT, not now
     Cues:       []string{"how does Maya commute"},   // embedded for semantic search
     Related:    []string{"manager: facts/people/sam.md"},
 }}, nil)
@@ -152,6 +201,97 @@ graph,_ := client.Graph(ctx, nil)
 search vocabulary. `Topics` is what you call before filing under a new topic,
 so you don't invent `facts/databases` beside an existing `facts/database`.
 `Forget` unpublishes a memory from retrieval; git keeps the history.
+
+## Tags and when it happened
+
+```go
+// Every memory drawn from this conversation carries the tags, and is dated to
+// when it happened rather than when it was sent.
+turns := []gitloom.Turn{{Role: "user", Content: "We just checked in near Gion."}}
+err = client.Remember(ctx, turns, &gitloom.RememberOptions{
+    Tags:       []string{"trip", "#japan"},
+    OccurredAt: gitloom.Date("2026-05-14T19:30"),   // read in Timezone
+    Timezone:   "Asia/Kolkata",
+})
+
+err = client.Write(ctx, []gitloom.NewMemory{{
+    Path:       "facts/travel/kyoto.md",
+    Content:    "Stayed four nights in Kyoto, at a ryokan near Gion.",
+    Tags:       []string{"trip", "#japan"},
+    OccurredAt: gitloom.At(time.Date(2026, 5, 14, 14, 0, 0, 0, time.UTC)),
+}}, nil)
+```
+
+`OccurredAt` takes `gitloom.At(t)` for an instant, sent as epoch seconds;
+`gitloom.Day(2026, time.May, 14)` for a calendar day with no time of day; or
+`gitloom.Date(s)` for text the server reads — a date, RFC 3339 with an offset,
+or a datetime without one, read in `Timezone`. The `Date` fields it replaces
+still work and are deprecated.
+
+Tags are trimmed and lowercased, and hold letters, digits, spaces and
+`- _ . : / # @` — up to 32 tags of 64 characters. One that breaks the rules
+refuses the write with an `*APIError` whose `Code` is `invalid_tag` and whose
+message names it, e.g. `memories[1].tags[0]`.
+
+Recall reports them back:
+
+```go
+res, _ := client.Recall(ctx, "where did I stay in Kyoto", nil)
+for _, m := range res.Memories {
+    when := m.OccurredAt.Format(time.RFC3339)
+    if m.OccurredPrecision == "day" {
+        when = m.OccurredAt.Format(time.DateOnly)   // only the date is known
+    }
+    fmt.Println(m.Path, m.UserTags, when, m.OccurredSource, m.UpdatedAt)
+}
+```
+
+`Tags` lists yours first, then the ones GitLoom inferred; `UserTags` holds
+yours alone. `CreatedAt`, `UpdatedAt`, `OccurredAt` and `ExpiresAt` are
+`time.Time` in UTC, zero when absent. `OccurredSource` says how the time is
+known: `user` (you said), `extracted` (the memory names the day), `said` (when
+its conversation happened) or `written`. The `Created` and `Updated` strings
+are deprecated.
+
+## Errors
+
+```go
+_, err := mem.Recall(ctx, "what camera do I own", nil)
+
+var apiErr *gitloom.APIError
+var netErr *url.Error
+switch {
+case errors.As(err, &apiErr) && apiErr.Status == http.StatusTooManyRequests:
+    fmt.Println("slow down for", apiErr.RetryAfter)   // zero when the server sent no Retry-After
+case errors.As(err, &apiErr):
+    fmt.Println(apiErr.Status, apiErr.Code, apiErr.Message)
+case errors.Is(err, context.DeadlineExceeded):
+    fmt.Println("timed out:", err)                    // your context's deadline, or the client's timeout
+case errors.Is(err, context.Canceled):
+    fmt.Println("canceled:", err)
+case errors.As(err, &netErr):
+    fmt.Println("network error:", err)                // DNS, refused connection, reset …
+}
+```
+
+A refusal is an `*APIError`. Its `Code` is the API's own (`invalid_tag`,
+`quota_exceeded`, `rate_limited` …), or `unauthorized` when the gateway refused
+the key, or `http_<status>` for any other error that carried no code. Nothing
+is retried for you; a 429 carries the server's `RetryAfter`.
+
+`New` cannot fail, so a missing or malformed key is reported by the first
+request, and every one after, before anything is sent, with `Status` 0. The
+key is trimmed first:
+`missing_api_key` means there was none, from `New` or `GITLOOM_API_KEY`, and
+`invalid_api_key` that it held whitespace or control characters.
+
+A network failure is not an `*APIError`. The cause stays wrapped and the
+message starts `gitloom: timed out:`, `gitloom: canceled:` or
+`gitloom: network error:`, so detect a timeout with
+`errors.Is(err, context.DeadlineExceeded)`, a cancellation with
+`errors.Is(err, context.Canceled)`, and anything else with `*url.Error` (or
+`net.Error`). `ErrNoQuery` and `ErrNoAnswer` are returned as they are, and no
+error ever holds the API key.
 
 ## Docs
 

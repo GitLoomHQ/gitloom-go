@@ -12,10 +12,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -43,10 +46,11 @@ func WithNamespace(ns string) Option { return func(c *Client) { c.namespace = ns
 func WithHTTPClient(h *http.Client) Option { return func(c *Client) { c.http = h } }
 
 // New builds a client. An empty key falls back to GITLOOM_API_KEY, so the
-// zero-config path is `gitloom.New("")` with the key in the environment.
+// zero-config path is `gitloom.New("")` with the key in the environment. The
+// key is trimmed; a missing or malformed one fails the first request.
 func New(apiKey string, opts ...Option) *Client {
-	if apiKey == "" {
-		apiKey = os.Getenv("GITLOOM_API_KEY")
+	if apiKey = strings.TrimSpace(apiKey); apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("GITLOOM_API_KEY"))
 	}
 	c := &Client{
 		apiKey:    apiKey,
@@ -60,14 +64,24 @@ func New(apiKey string, opts ...Option) *Client {
 	return c
 }
 
-// APIError is a refusal from the API, carrying its machine-readable code.
+// APIError is a refusal from the API, carrying its machine-readable code: the
+// API's own, "unauthorized" for a key the gateway refused, "http_<status>" for
+// any other error without one, or, with Status 0 and before any request,
+// "missing_api_key" or "invalid_api_key". A network failure or timeout is not
+// an APIError.
 type APIError struct {
 	Status  int
 	Code    string
 	Message string
+	// RetryAfter is a 429's Retry-After, zero when it sent none. Nothing is
+	// retried for you.
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
+	if e.Status == 0 {
+		return fmt.Sprintf("gitloom: %s (%s)", e.Message, e.Code)
+	}
 	return fmt.Sprintf("gitloom: %s (%d %s)", e.Message, e.Status, e.Code)
 }
 
@@ -75,6 +89,16 @@ func (e *APIError) Error() string {
 // half-succeeded double-charges the meter and double-stores the message, which
 // costs more than surfacing the error.
 func (c *Client) request(ctx context.Context, method, path string, body, out any) error {
+	if c.apiKey == "" {
+		return &APIError{Code: "missing_api_key",
+			Message: "No API key. Pass one to gitloom.New or set GITLOOM_API_KEY."}
+	}
+	for i := 0; i < len(c.apiKey); i++ {
+		if b := c.apiKey[i]; b < 0x21 || b > 0x7e {
+			return &APIError{Code: "invalid_api_key",
+				Message: "The API key contains whitespace or control characters — check GITLOOM_API_KEY, or the key passed to the client."}
+		}
+	}
 	var payload io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -94,16 +118,20 @@ func (c *Client) request(ctx context.Context, method, path string, body, out any
 
 	res, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("gitloom: %s %s: %w", method, path, err)
+		return transportError(err)
 	}
 	defer res.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 32<<20))
 	if err != nil {
-		return fmt.Errorf("gitloom: read response: %w", err)
+		return transportError(err)
 	}
 
 	if res.StatusCode >= 400 {
-		return apiErrorFrom(res.StatusCode, raw)
+		e := apiErrorFrom(res.StatusCode, raw)
+		if res.StatusCode == http.StatusTooManyRequests {
+			e.RetryAfter = retryAfter(res.Header.Get("Retry-After"))
+		}
+		return e
 	}
 	if out == nil || len(raw) == 0 {
 		return nil
@@ -114,33 +142,73 @@ func (c *Client) request(ctx context.Context, method, path string, body, out any
 	return nil
 }
 
-// apiErrorFrom decodes both error shapes the API uses: the envelope
-// {"error":{"code","message"}} everywhere, and the flat {"error":"..."} the
-// retrieval routes answer with.
+// transportError keeps the cause wrapped, so errors.Is finds a deadline or a
+// cancellation, and says which kind of failure it was.
+func transportError(err error) error {
+	var ne net.Error
+	switch {
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("gitloom: canceled: %w", err)
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return fmt.Errorf("gitloom: timed out: %w", err)
+	}
+	return fmt.Errorf("gitloom: network error: %w", err)
+}
+
+// retryAfter reads Retry-After as delta-seconds, digits only; an HTTP date or
+// a signed number is zero.
+func retryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" || strings.Trim(h, "0123456789") != "" {
+		return 0
+	}
+	n, err := strconv.Atoi(h)
+	if err != nil {
+		return 0
+	}
+	return time.Duration(n) * time.Second
+}
+
+// apiErrorFrom reads an error response. The API answers with the envelope
+// {"error":{"code","message"}}, either part of which may be missing, and once
+// answered with a flat {"error":"..."};
+// the gateway in front of it answers a refused or missing key with a bare
+// {"message"}, and anything else may be text.
 func apiErrorFrom(status int, raw []byte) *APIError {
-	var envelope struct {
-		Error json.RawMessage `json:"error"`
-	}
-	e := &APIError{Status: status, Code: "http_error", Message: strings.TrimSpace(string(raw))}
-	if json.Unmarshal(raw, &envelope) != nil || len(envelope.Error) == 0 {
+	var obj map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &obj)
+	e := &APIError{Status: status, Code: fmt.Sprintf("http_%d", status), Message: http.StatusText(status)}
+	var env map[string]json.RawMessage
+	if json.Unmarshal(obj["error"], &env) == nil && env != nil {
+		var code, msg string
+		if json.Unmarshal(env["code"], &code) == nil && code != "" {
+			e.Code = code
+		}
+		if json.Unmarshal(env["message"], &msg) == nil && msg != "" {
+			e.Message = msg
+		}
 		return e
 	}
-	var flat string
-	if json.Unmarshal(envelope.Error, &flat) == nil {
+	switch status {
+	case http.StatusUnauthorized:
+		return &APIError{Status: status, Code: "unauthorized",
+			Message: "No API key was accepted (401 Unauthorized) — check the API key (GITLOOM_API_KEY, or the key passed to the client)."}
+	case http.StatusForbidden:
+		return &APIError{Status: status, Code: "unauthorized",
+			Message: "The API key was not accepted (403 Forbidden) — check the API key (GITLOOM_API_KEY, or the key passed to the client), or whether it has been revoked."}
+	}
+	var flat, msg string
+	text := strings.TrimSpace(string(raw))
+	switch {
+	case json.Unmarshal(obj["error"], &flat) == nil && flat != "":
 		e.Message = flat
-		return e
-	}
-	var coded struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	}
-	if json.Unmarshal(envelope.Error, &coded) == nil {
-		if coded.Code != "" {
-			e.Code = coded.Code
+	case json.Unmarshal(obj["message"], &msg) == nil && msg != "":
+		e.Message = msg
+	case text != "" && text != "null":
+		if r := []rune(text); len(r) > 300 {
+			text = string(r[:300]) + "…"
 		}
-		if coded.Message != "" {
-			e.Message = coded.Message
-		}
+		e.Message = text
 	}
 	return e
 }

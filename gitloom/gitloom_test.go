@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -305,15 +307,273 @@ func TestEditForksAndSwitches(t *testing.T) {
 	}
 }
 
-func TestAPIErrorBothShapes(t *testing.T) {
-	for _, tc := range []struct{ body, wantCode, wantMsg string }{
-		{`{"error":{"code":"quota_exceeded","message":"limit reached"}}`, "quota_exceeded", "limit reached"},
-		{`{"error":"memory unavailable"}`, "http_error", "memory unavailable"},
+// The error contract every GitLoom SDK shares. The gateway in front of the API
+// refuses a bad or missing key itself, with no envelope.
+func TestAPIErrorContract(t *testing.T) {
+	long := strings.Repeat("x", 400)
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		wantCode string
+		wantMsg  string
+	}{
+		{"envelope", 429, `{"error":{"code":"quota_exceeded","message":"limit reached"}}`, "quota_exceeded", "limit reached"},
+		{"gateway 403", 403, `{"message":"Forbidden"}`, "unauthorized",
+			"The API key was not accepted (403 Forbidden) — check the API key (GITLOOM_API_KEY, or the key passed to the client), or whether it has been revoked."},
+		{"gateway 401", 401, `{"message":"Unauthorized"}`, "unauthorized",
+			"No API key was accepted (401 Unauthorized) — check the API key (GITLOOM_API_KEY, or the key passed to the client)."},
+		{"enveloped 403", 403, `{"error":{"code":"dashboard_only","message":"keys are managed from the dashboard"}}`,
+			"dashboard_only", "keys are managed from the dashboard"},
+		{"envelope without a code", 500, `{"error":{"message":"boom"}}`, "http_500", "boom"},
+		{"envelope without a code on a 403", 403, `{"error":{"message":"boom"}}`, "http_403", "boom"},
+		{"envelope without a message", 409, `{"error":{"code":"conflict"}}`, "conflict", "Conflict"},
+		{"empty envelope", 500, `{"error":{}}`, "http_500", "Internal Server Error"},
+		{"envelope with a numeric code", 500, `{"error":{"code":5,"message":"boom"}}`, "http_500", "boom"},
+		{"null envelope on a 403", 403, `{"error":null,"message":"Forbidden"}`, "unauthorized",
+			"The API key was not accepted (403 Forbidden) — check the API key (GITLOOM_API_KEY, or the key passed to the client), or whether it has been revoked."},
+		{"gateway message", 429, `{"message":"Too Many Requests"}`, "http_429", "Too Many Requests"},
+		{"text 500", 500, "  upstream connect error\n", "http_500", "upstream connect error"},
+		{"JSON null 500", 500, "null", "http_500", "Internal Server Error"},
+		{"whitespace 500", 500, " \n\t ", "http_500", "Internal Server Error"},
+		{"empty 503", 503, "", "http_503", "Service Unavailable"},
+		{"JSON array 502", 502, `["a"]`, "http_502", `["a"]`},
+		{"JSON string 500", 500, `"oops"`, "http_500", `"oops"`},
+		{"JSON number 500", 500, `42`, "http_500", `42`},
+		{"flat error string", 500, `{"error":"memory unavailable"}`, "http_500", "memory unavailable"},
+		{"flat error on a 403", 403, `{"error":"forbidden"}`, "unauthorized",
+			"The API key was not accepted (403 Forbidden) — check the API key (GITLOOM_API_KEY, or the key passed to the client), or whether it has been revoked."},
+		{"long text", 500, long, "http_500", long[:300] + "…"},
 	} {
-		e := apiErrorFrom(429, []byte(tc.body))
-		if e.Code != tc.wantCode || e.Message != tc.wantMsg {
-			t.Fatalf("%s -> %+v", tc.body, e)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(tc.status)
+			w.Write([]byte(tc.body))
+		}))
+		c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+		_, err := c.Recall(context.Background(), "x", nil)
+		srv.Close()
+		var api *APIError
+		if !errors.As(err, &api) {
+			t.Errorf("%s: err = %v, want *APIError", tc.name, err)
+			continue
 		}
+		if api.Status != tc.status || api.Code != tc.wantCode || api.Message != tc.wantMsg {
+			t.Errorf("%s: got %d %q %q, want %d %q %q", tc.name, api.Status, api.Code, api.Message,
+				tc.status, tc.wantCode, tc.wantMsg)
+		}
+	}
+}
+
+func TestMissingKeyFailsBeforeAnyRequest(t *testing.T) {
+	var called atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called.Store(true) }))
+	defer srv.Close()
+
+	for _, tc := range []struct{ key, env string }{{"", ""}, {"   ", ""}, {"", " \t\n"}, {"\t", "  "}} {
+		t.Setenv("GITLOOM_API_KEY", tc.env)
+		c := New(tc.key, WithBaseURL(srv.URL))
+		_, err := c.Recall(context.Background(), "x", nil)
+		var api *APIError
+		if !errors.As(err, &api) || api.Code != "missing_api_key" || api.Status != 0 ||
+			api.Message != "No API key. Pass one to gitloom.New or set GITLOOM_API_KEY." {
+			t.Errorf("key %q env %q: err = %v", tc.key, tc.env, err)
+		}
+		if err := c.Write(context.Background(), []NewMemory{{Path: "facts/a.md", Content: "a"}}, nil); !errors.As(err, &api) {
+			t.Errorf("Write: err = %v", err)
+		}
+	}
+	if called.Load() {
+		t.Error("a request went out without a key")
+	}
+
+	t.Setenv("GITLOOM_API_KEY", "gl_env")
+	if New("").apiKey != "gl_env" || New("  ").apiKey != "gl_env" {
+		t.Error("an empty or blank key should fall back to GITLOOM_API_KEY")
+	}
+}
+
+// A transport failure is not a refusal from the API: it stays the wrapped
+// cause, so errors.Is and errors.As still find it, and it says what kind it was.
+func TestTransportErrorsSayWhatHappened(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer slow.Close()
+	var api *APIError
+	var urlErr *url.Error
+
+	c := New("k", WithBaseURL(slow.URL), WithHTTPClient(&http.Client{Timeout: 20 * time.Millisecond}))
+	_, err := c.Recall(context.Background(), "x", nil)
+	if !strings.HasPrefix(fmt.Sprint(err), "gitloom: timed out: ") || !errors.Is(err, context.DeadlineExceeded) || errors.As(err, &api) {
+		t.Errorf("client timeout: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = New("k", WithBaseURL(slow.URL)).Recall(ctx, "x", nil)
+	if !strings.HasPrefix(fmt.Sprint(err), "gitloom: timed out: ") || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("context deadline: %v", err)
+	}
+
+	_, err = New("k", WithBaseURL(refusedURL(t))).Recall(context.Background(), "x", nil)
+	if !strings.HasPrefix(fmt.Sprint(err), "gitloom: network error: ") || !errors.As(err, &urlErr) || errors.As(err, &api) {
+		t.Errorf("refused: %v", err)
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	cancel()
+	_, err = New("k", WithBaseURL(slow.URL)).Recall(ctx, "x", nil)
+	if !strings.HasPrefix(fmt.Sprint(err), "gitloom: canceled: ") || !errors.Is(err, context.Canceled) {
+		t.Errorf("canceled: %v", err)
+	}
+}
+
+// refusedURL is an address nothing listens on.
+func refusedURL(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return "http://" + addr
+}
+
+func TestTheKeyNeverAppearsInAnError(t *testing.T) {
+	forbidden := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"Forbidden"}`))
+	}))
+	defer forbidden.Close()
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer slow.Close()
+	refused := refusedURL(t)
+
+	for _, key := range []string{"gl_test_LEAKPROBE_9x7q", "gl_test_LEAKPROBE_9x7q\n", "glk_SEC\r\nRET_LEAKPROBE"} {
+		for name, c := range map[string]*Client{
+			"403":     New(key, WithBaseURL(forbidden.URL)),
+			"refused": New(key, WithBaseURL(refused)),
+			"timeout": New(key, WithBaseURL(slow.URL), WithHTTPClient(&http.Client{Timeout: 20 * time.Millisecond})),
+		} {
+			_, err := c.Recall(context.Background(), "x", nil)
+			if err == nil {
+				t.Fatalf("%q %s: no error", key, name)
+			}
+			for depth, e := range causes(err) {
+				for _, f := range []string{"%v", "%+v", "%#v", "%s", "%q"} {
+					if out := fmt.Sprintf(f, e); strings.Contains(out, "LEAKPROBE") || strings.Contains(out, "SEC") {
+						t.Errorf("%q %s: %s at depth %d holds the key: %s", key, name, f, depth, out)
+					}
+				}
+			}
+		}
+	}
+}
+
+// causes is err and everything it wraps, depth first.
+func causes(err error) []error {
+	out := []error{err}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		if next := u.Unwrap(); next != nil {
+			out = append(out, causes(next)...)
+		}
+	case interface{ Unwrap() []error }:
+		for _, next := range u.Unwrap() {
+			out = append(out, causes(next)...)
+		}
+	}
+	return out
+}
+
+func TestTheKeyIsTrimmedAndAMalformedOneNeverSent(t *testing.T) {
+	var auth []string
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auth = append(auth, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Write([]byte(`{"memories":[]}`))
+	}))
+	defer srv.Close()
+
+	if _, err := New("glk_SECRET\n", WithBaseURL(srv.URL)).Recall(context.Background(), "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GITLOOM_API_KEY", "  glk_ENV\r\n")
+	if _, err := New(" ", WithBaseURL(srv.URL)).Recall(context.Background(), "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(auth, "|") != "Bearer glk_SECRET|Bearer glk_ENV" {
+		t.Errorf("sent %q", auth)
+	}
+
+	for _, key := range []string{"glk_SEC\r\nRET", "glk_SEC RET", "glk_SEC\x00RET", "glk_SEC\u00e9RET"} {
+		_, err := New(key, WithBaseURL(srv.URL)).Recall(context.Background(), "x", nil)
+		var api *APIError
+		if !errors.As(err, &api) || api.Code != "invalid_api_key" || api.Status != 0 || api.Message !=
+			"The API key contains whitespace or control characters — check GITLOOM_API_KEY, or the key passed to the client." {
+			t.Errorf("%q: err = %v", key, err)
+		}
+		for _, e := range causes(err) {
+			for _, f := range []string{"%v", "%+v", "%#v"} {
+				if out := fmt.Sprintf(f, e); strings.Contains(out, "SEC") {
+					t.Errorf("%q: %s holds the key: %s", key, f, out)
+				}
+			}
+		}
+	}
+	if len(auth) != 2 {
+		t.Errorf("%d requests; a malformed key must not be sent", len(auth))
+	}
+}
+
+// The API's retrieval routes once answered {"error":"text"}, and a deployment
+// that still does must not lose the text.
+func TestAFlatErrorBodyIsTheMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"memory unavailable"}`))
+	}))
+	defer srv.Close()
+	_, err := New("k", WithBaseURL(srv.URL)).Recall(context.Background(), "x", nil)
+	var api *APIError
+	if !errors.As(err, &api) || api.Code != "http_503" || api.Message != "memory unavailable" {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// Retry-After is surfaced, never acted on.
+func TestRateLimitCarriesRetryAfter(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if h := r.URL.Query().Get("q"); h != "none" {
+			w.Header().Set("Retry-After", h)
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":{"code":"rate_limited","message":"slow down"}}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	for header, want := range map[string]time.Duration{
+		"7": 7 * time.Second, "none": 0, "Wed, 21 Oct 2026 07:28:00 GMT": 0, "-3": 0,
+		"+30": 0, "1.5": 0, "0": 0, "120": 2 * time.Minute,
+	} {
+		_, err := c.Recall(context.Background(), header, nil)
+		var api *APIError
+		if !errors.As(err, &api) || api.Code != "rate_limited" {
+			t.Errorf("Retry-After %q: err = %v", header, err)
+		} else if api.RetryAfter != want {
+			t.Errorf("Retry-After %q: RetryAfter = %v, want %v", header, api.RetryAfter, want)
+		}
+	}
+	if hits.Load() != 8 {
+		t.Errorf("%d requests for 8 calls; a 429 must not be retried", hits.Load())
 	}
 }
 
@@ -493,6 +753,75 @@ func TestRecallLeavesDefaultsOffTheWire(t *testing.T) {
 	}
 }
 
+func TestRecallSendsTheLanePathAndReadsWhatItAdds(t *testing.T) {
+	var q url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q = r.URL.Query()
+		w.Write([]byte(`{"namespace":"ns","query":"x","mode":"summary","rank":"jev","rank_fallback":true,
+			"memories":[{"path":"turns/conv-1/main/000001-user-aa.md","tier":"facts",
+				"content":"user: I staked the tomatoes …","score":0.8,"matched":["lexical","time"],
+				"store":"turn","said":["2026-05-21"],"excerpted":true}],
+			"candidates":9,"filtered_out":0,"millis":40,
+			"timings":{"lexical_ms":0,"vector_ms":0,"graph_ms":0,"embed_ms":20,"lanes_ms":8,"rank_ms":300,
+				"lane":[{"lane":"time","store":"turn","ms":2,"n":1},{"lane":"graph","store":"memory","ms":1,"n":0,"err":"timeout"}]}}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	res, err := c.Recall(context.Background(), "x", &RecallOptions{
+		Mode: ModeSummary, Rank: RankJev, MaxChars: 12000, Model: ModelSonnet,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{"rank": "jev", "max_chars": "12000", "model": "sonnet"} {
+		if q.Get(key) != want {
+			t.Errorf("%s = %q, want %q", key, q.Get(key), want)
+		}
+	}
+	if res.Rank != RankJev || !res.RankFallback {
+		t.Errorf("rank = %q, fallback = %v", res.Rank, res.RankFallback)
+	}
+	m := res.Memories[0]
+	if m.Store != "turn" || strings.Join(m.Said, ",") != "2026-05-21" || !m.Excerpted || m.Matched[1] != "time" {
+		t.Errorf("memory = %+v", m)
+	}
+	tm := res.Timings
+	if tm.EmbedMillis != 20 || tm.LanesMillis != 8 || tm.RankMillis != 300 || len(tm.Lane) != 2 {
+		t.Fatalf("timings = %+v", tm)
+	}
+	if tm.Lane[0] != (LaneTiming{Lane: "time", Store: "turn", Millis: 2, N: 1}) || tm.Lane[1].Err != "timeout" {
+		t.Errorf("lanes = %+v", tm.Lane)
+	}
+}
+
+// A call that predates the lane path must send the query string it always
+// did, and read back the envelope it always did.
+func TestLanePathStaysOffTheWireUnlessAsked(t *testing.T) {
+	var raw []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw = append(raw, r.URL.RawQuery)
+		w.Write([]byte(`{"namespace":"ns","mode":"raw","memories":[],"millis":1}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+	ctx := context.Background()
+
+	res, err := c.Recall(ctx, "x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Recall(ctx, "x", &RecallOptions{Limit: 5, MaxChars: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"namespace=ns&q=x", "limit=5&namespace=ns&q=x"}; strings.Join(raw, " ") != strings.Join(want, " ") {
+		t.Errorf("queries = %q, want %q", raw, want)
+	}
+	if res.Rank != "" || res.RankFallback {
+		t.Errorf("rank = %q, fallback = %v", res.Rank, res.RankFallback)
+	}
+}
+
 func TestAnswerSummarizesAndGoesAgenticOnRequest(t *testing.T) {
 	f := &fakeAPI{}
 	srv := httptest.NewServer(http.HandlerFunc(f.handle))
@@ -511,6 +840,193 @@ func TestAnswerSummarizesAndGoesAgenticOnRequest(t *testing.T) {
 	}
 	if f.retrieveQueries[1].Get("mode") != "agentic" {
 		t.Errorf("mode = %q, want agentic", f.retrieveQueries[1].Get("mode"))
+	}
+}
+
+func TestAnswerPassesTheLanePathThrough(t *testing.T) {
+	f := &fakeAPI{}
+	srv := httptest.NewServer(http.HandlerFunc(f.handle))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	if _, err := c.Answer(context.Background(), "x", &RecallOptions{
+		Rank: RankFused, MaxChars: 8000, Model: ModelHaiku,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.retrieveQueries[0]
+	for key, want := range map[string]string{"mode": "summary", "rank": "fused", "max_chars": "8000", "model": "haiku"} {
+		if q.Get(key) != want {
+			t.Errorf("%s = %q, want %q", key, q.Get(key), want)
+		}
+	}
+}
+
+// A tag may hold a # or a space, and an unencoded # ends the query string, so
+// the server would see a filter that names no tag.
+func TestRecallSendsTheTimeFilterAndEncodesTags(t *testing.T) {
+	r, c := newRecorder(t, map[string]any{"memories": []any{}})
+	ist := time.FixedZone("IST", 5*3600+1800)
+
+	if _, err := c.Recall(context.Background(), "where did we travel", &RecallOptions{
+		Tags: []string{"#work", "q3 plan"}, TagsAll: []string{"@maya"},
+		Since:     time.Date(2026, 5, 1, 0, 0, 0, 0, ist),
+		Until:     time.Date(2026, 5, 31, 23, 59, 59, 0, time.UTC),
+		TimeField: TimeOccurred, TZ: "Asia/Kolkata",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(r.query, "#") || !strings.Contains(r.query, "tags=%23work%2Cq3+plan") ||
+		!strings.Contains(r.query, "tags_all=%40maya") {
+		t.Errorf("raw query = %s", r.query)
+	}
+	q, _ := url.ParseQuery(r.query)
+	for key, want := range map[string]string{
+		"tags": "#work,q3 plan", "since": "2026-04-30T18:30:00Z", "until": "2026-05-31T23:59:59Z",
+		"time_field": "occurred", "tz": "Asia/Kolkata", "q": "where did we travel",
+	} {
+		if q.Get(key) != want {
+			t.Errorf("%s = %q, want %q", key, q.Get(key), want)
+		}
+	}
+}
+
+// Any one filter is enough to list without a question, and the question is
+// then left off the wire rather than sent empty.
+func TestRecallListsByFilterWithoutAQuery(t *testing.T) {
+	day := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	for name, o := range map[string]RecallOptions{
+		"tags": {Tags: []string{"lease"}}, "tags_all": {TagsAll: []string{"lease"}},
+		"since": {Since: day}, "until": {Until: day},
+		"tiers": {Tiers: []string{"facts"}}, "paths": {Paths: []string{"facts/home"}},
+	} {
+		r, c := newRecorder(t, map[string]any{"mode": "raw", "memories": []map[string]any{
+			{"path": "facts/home/lease.md", "content": "The lease renews in March.", "score": 1},
+		}})
+		res, err := c.Recall(context.Background(), "", &o)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		q, _ := url.ParseQuery(r.query)
+		if _, sent := q["q"]; sent || q.Get(name) == "" {
+			t.Errorf("%s: query = %s", name, r.query)
+		}
+		if len(res.Memories) != 1 || res.Memories[0].Score != 1 {
+			t.Errorf("%s: memories = %+v", name, res.Memories)
+		}
+	}
+}
+
+func TestRecallWithNeitherQueryNorFilterFailsBeforeCalling(t *testing.T) {
+	r, c := newRecorder(t, nil)
+	ctx := context.Background()
+	for _, o := range []*RecallOptions{nil, {Limit: 5, TimeField: TimeOccurred, TZ: "Asia/Kolkata", MinScore: 0.3}} {
+		if _, err := c.Recall(ctx, "  ", o); !errors.Is(err, ErrNoQuery) {
+			t.Errorf("err = %v, want ErrNoQuery", err)
+		}
+	}
+	if _, err := c.Context(ctx, "", nil); !errors.Is(err, ErrNoQuery) {
+		t.Errorf("Context: err = %v, want ErrNoQuery", err)
+	}
+	if r.method != "" {
+		t.Error("the request was sent")
+	}
+}
+
+func TestRecallReadsTagsAndTimes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"namespace":"ns","mode":"raw","memories":[
+			{"path":"facts/gear/a7iii.md","content":"Bought a Sony A7III.","score":0.93,"matched":["lexical"],
+				"tags":["gear","camera"],"user_tags":["gear"],"created":"2026-07-31T10:02:11Z",
+				"created_at":1785492131,"updated_at":1785492131,"occurred_at":1785499200,
+				"occurred_source":"user","occurred_precision":"day","expires_at":1788091200},
+			{"path":"facts/b.md","content":"b","score":0.5,"matched":["cue"]}]}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	res, err := c.Recall(context.Background(), "what camera", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := res.Memories[0]
+	if m.UserTags[0] != "gear" || m.Tags[1] != "camera" || m.Created != "2026-07-31T10:02:11Z" {
+		t.Errorf("memory = %+v", m)
+	}
+	if want := time.Date(2026, 7, 31, 10, 2, 11, 0, time.UTC); !m.CreatedAt.Equal(want) || !m.UpdatedAt.Equal(want) {
+		t.Errorf("created %v updated %v, want %v", m.CreatedAt, m.UpdatedAt, want)
+	}
+	if m.OccurredAt.Format(time.DateOnly) != "2026-07-31" || m.OccurredAt.Location() != time.UTC ||
+		m.OccurredSource != "user" || m.OccurredPrecision != "day" {
+		t.Errorf("occurred %v %q %q", m.OccurredAt, m.OccurredSource, m.OccurredPrecision)
+	}
+	if m.ExpiresAt.Unix() != 1788091200 {
+		t.Errorf("expires %v", m.ExpiresAt)
+	}
+	bare := res.Memories[1]
+	if !bare.CreatedAt.IsZero() || !bare.OccurredAt.IsZero() || !bare.ExpiresAt.IsZero() {
+		t.Errorf("absent times must be zero: %+v", bare)
+	}
+
+	// A result kept as JSON must read back as it was sent.
+	b, err := json.Marshal(res.Memories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw []map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, sent := raw[1]["created_at"]; sent || raw[0]["occurred_at"] != float64(1785499200) {
+		t.Errorf("marshalled %s", b)
+	}
+	var back []Memory
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back[0].OccurredAt.Equal(m.OccurredAt) || !back[1].CreatedAt.IsZero() {
+		t.Errorf("round trip = %+v", back)
+	}
+}
+
+// The SDK never asks for time_format=iso, but a response in it must read into
+// the same times rather than fail.
+func TestRecallReadsISOTimes(t *testing.T) {
+	r, c := newRecorder(t, map[string]any{"memories": []map[string]any{{
+		"path": "facts/a.md", "content": "a", "score": 1, "tags": nil, "user_tags": nil,
+		"created_at": "2026-07-31T15:32:11+05:30", "updated_at": "2026-07-31T10:02:11Z",
+		"occurred_at": "2026-07-31T12:00:00Z", "occurred_precision": "day",
+	}}})
+	res, err := c.Recall(context.Background(), "", &RecallOptions{Tags: []string{"gear"}, TZ: "Asia/Kolkata"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(r.query, "time_format") {
+		t.Errorf("query %s asked for time_format", r.query)
+	}
+	m := res.Memories[0]
+	want := time.Date(2026, 7, 31, 10, 2, 11, 0, time.UTC)
+	if !m.CreatedAt.Equal(want) || m.CreatedAt.Location() != time.UTC || !m.UpdatedAt.Equal(want) ||
+		m.OccurredAt.Format(time.DateOnly) != "2026-07-31" || !m.ExpiresAt.IsZero() || m.Tags != nil {
+		t.Errorf("memory = %+v", m)
+	}
+}
+
+func TestRecallSurfacesAFilterRefusal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"code":"invalid_date","message":"since is after until"}}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	_, err := c.Recall(context.Background(), "", &RecallOptions{
+		Since: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), Until: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+	})
+	var api *APIError
+	if !errors.As(err, &api) || api.Code != "invalid_date" || api.Message != "since is after until" {
+		t.Errorf("err = %v", err)
 	}
 }
 

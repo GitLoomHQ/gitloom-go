@@ -3,9 +3,12 @@ package gitloom
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 // recorder captures what the client actually put on the wire, which is the
@@ -22,7 +25,7 @@ func newRecorder(t *testing.T, reply any) (*recorder, *Client) {
 	t.Helper()
 	r := &recorder{reply: reply}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		r.method, r.path, r.query = req.Method, req.URL.Path, req.URL.RawQuery
+		r.method, r.path, r.query, r.body = req.Method, req.URL.Path, req.URL.RawQuery, nil
 		_ = json.NewDecoder(req.Body).Decode(&r.body)
 		if r.reply != nil {
 			_ = json.NewEncoder(w).Encode(r.reply)
@@ -185,5 +188,194 @@ func TestRecallCanDropProvenance(t *testing.T) {
 	}
 	if contains(r.query, "no_relations") {
 		t.Error("relations were dropped without being asked to be")
+	}
+}
+
+func TestWriteSendsTagsAndWhenItHappened(t *testing.T) {
+	r, c := newRecorder(t, map[string]any{"status": "accepted"})
+	ist := time.FixedZone("IST", 5*3600+1800)
+
+	err := c.Write(context.Background(), []NewMemory{
+		{Path: "facts/a.md", Content: "a", Tags: []string{"#work", "q3 plan"},
+			OccurredAt: At(time.Date(2026, 7, 31, 15, 30, 0, 0, ist))},
+		{Path: "facts/b.md", Content: "b", OccurredAt: Day(2026, time.July, 19)},
+		{Path: "facts/c.md", Content: "c", OccurredAt: Date("2026-07-19T09:30")},
+		{Path: "facts/d.md", Content: "d", OccurredAt: Unix(1785492000)},
+		{Path: "facts/e.md", Content: "e", OccurredAt: At(time.Date(1965, 3, 1, 0, 0, 0, 0, time.UTC))},
+		{Path: "facts/f.md", Content: "f", Date: "2026-07-19"},
+	}, &WriteOptions{Timezone: "Asia/Kolkata"})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if r.body["timezone"] != "Asia/Kolkata" {
+		t.Errorf("timezone = %v", r.body["timezone"])
+	}
+	mems := r.body["memories"].([]any)
+	at := func(i int) any { return mems[i].(map[string]any)["occurred_at"] }
+
+	// A time.Time goes as epoch seconds: a JSON number, whatever its zone.
+	if at(0) != float64(1785492000) || at(3) != float64(1785492000) {
+		t.Errorf("instants = %v, %v; want the number 1785492000", at(0), at(3))
+	}
+	if at(1) != "2026-07-19" {
+		t.Errorf("day = %v; a date alone is what marks day precision", at(1))
+	}
+	if at(2) != "2026-07-19T09:30" {
+		t.Errorf("text = %v, want it sent as given", at(2))
+	}
+	// Too few digits for the server to read as epoch seconds.
+	if at(4) != "1965-03-01T00:00:00Z" {
+		t.Errorf("1965 = %v, want RFC 3339", at(4))
+	}
+	last := mems[5].(map[string]any)
+	if _, sent := last["occurred_at"]; sent || last["date"] != "2026-07-19" {
+		t.Errorf("deprecated date: %v", last)
+	}
+	if tags := mems[0].(map[string]any)["tags"].([]any); len(tags) != 2 || tags[0] != "#work" {
+		t.Errorf("tags = %v", tags)
+	}
+}
+
+func TestRememberSendsTagsAndWhenTheConversationHappened(t *testing.T) {
+	r, c := newRecorder(t, map[string]any{"status": "accepted"})
+	ctx := context.Background()
+	turns := []Turn{{Role: "user", Content: "we landed in Kyoto"}}
+
+	if err := c.Remember(ctx, turns, &RememberOptions{
+		Tags: []string{"trip"}, OccurredAt: Date("2026-05-14T19:30"), Timezone: "Asia/Kolkata",
+	}); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if r.body["occurred_at"] != "2026-05-14T19:30" || r.body["timezone"] != "Asia/Kolkata" {
+		t.Errorf("body = %v", r.body)
+	}
+	if tags, _ := r.body["tags"].([]any); len(tags) != 1 || tags[0] != "trip" {
+		t.Errorf("tags = %v", r.body["tags"])
+	}
+	if _, ok := r.body["memories"]; ok {
+		t.Error("a conversation must not send memories")
+	}
+
+	if err := c.Remember(ctx, turns, &RememberOptions{OccurredAt: At(time.Unix(1778767200, 0))}); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if r.body["occurred_at"] != float64(1778767200) {
+		t.Errorf("occurred_at = %v, want epoch seconds", r.body["occurred_at"])
+	}
+
+	if err := c.Remember(ctx, turns, &RememberOptions{Date: "2026-05-14"}); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	for _, key := range []string{"tags", "occurred_at", "timezone"} {
+		if _, ok := r.body[key]; ok {
+			t.Errorf("%s sent unasked", key)
+		}
+	}
+	if r.body["date"] != "2026-05-14" {
+		t.Errorf("deprecated date = %v", r.body["date"])
+	}
+}
+
+// A batch of NewMemory kept as JSON, as a migration does, must read back.
+func TestWhenRoundTrips(t *testing.T) {
+	in := `[{"path":"facts/a.md","content":"a","occurred_at":1785492000.7},
+		{"path":"facts/b.md","content":"b","occurred_at":"2026-07-19"},
+		{"path":"facts/c.md","content":"c"}]`
+	var mems []NewMemory
+	if err := json.Unmarshal([]byte(in), &mems); err != nil {
+		t.Fatal(err)
+	}
+	if !mems[2].OccurredAt.IsZero() {
+		t.Error("an absent time should be zero")
+	}
+	out, err := json.Marshal(mems)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"occurred_at":1785492000}`, `"occurred_at":"2026-07-19"`} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("%s is missing %s", out, want)
+		}
+	}
+	if strings.Count(string(out), "occurred_at") != 2 {
+		t.Errorf("an unset time was sent: %s", out)
+	}
+}
+
+func TestWriteSurfacesARefusedTag(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"code":"invalid_tag","message":"memories[1].tags[0] \"a,b\" has a character tags may not hold"}}`))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("ns"))
+
+	err := c.Write(context.Background(), []NewMemory{
+		{Path: "facts/a.md", Content: "a"}, {Path: "facts/b.md", Content: "b", Tags: []string{"a,b"}},
+	}, nil)
+	var api *APIError
+	if !errors.As(err, &api) || api.Status != 400 || api.Code != "invalid_tag" ||
+		!strings.Contains(api.Message, "memories[1].tags[0]") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestGetReadsTagsAndTimes(t *testing.T) {
+	devBody := `{"confidence":0,"content":"…","created":"2026-10-04T13:33:23Z","created_at":1791120803,"kind":"file","millis":0,"namespace":"x","occurred_at":1772712000,"occurred_precision":"day","occurred_source":"user","path":"facts/test/a.md","tags":["home","lease"],"tier":"facts","title":"","updated":"2026-10-04T13:33:23Z","updated_at":1791120803,"user_tags":["home","lease"]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("path") == "facts/test/untagged.md" {
+			w.Write([]byte(`{"namespace":"x","path":"facts/test/untagged.md","content":"b","tags":null,"user_tags":null,"created_at":1791120803}`))
+			return
+		}
+		w.Write([]byte(devBody))
+	}))
+	defer srv.Close()
+	c := New("k", WithBaseURL(srv.URL), WithNamespace("x"))
+	ctx := context.Background()
+
+	m, err := c.Get(ctx, "facts/test/a.md", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written := time.Date(2026, 10, 4, 13, 33, 23, 0, time.UTC)
+	if !m.CreatedAt.Equal(written) || !m.UpdatedAt.Equal(written) || m.CreatedAt.Location() != time.UTC {
+		t.Errorf("created %v updated %v, want %v", m.CreatedAt, m.UpdatedAt, written)
+	}
+	if m.OccurredAt.Format(time.DateOnly) != "2026-03-05" || m.OccurredPrecision != "day" || m.OccurredSource != "user" {
+		t.Errorf("occurred %v %q %q", m.OccurredAt, m.OccurredPrecision, m.OccurredSource)
+	}
+	if strings.Join(m.UserTags, ",") != "home,lease" || strings.Join(m.Tags, ",") != "home,lease" || !m.ExpiresAt.IsZero() {
+		t.Errorf("memory = %+v", m)
+	}
+	if m.Created != "2026-10-04T13:33:23Z" || m.Kind != "file" || m.Tier != "facts" {
+		t.Errorf("memory = %+v", m)
+	}
+
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back StoredMemory
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.OccurredAt.Equal(m.OccurredAt) || !back.CreatedAt.Equal(written) || back.OccurredPrecision != "day" {
+		t.Errorf("round trip %s = %+v", b, back)
+	}
+
+	var iso StoredMemory
+	if err := json.Unmarshal([]byte(`{"path":"facts/test/a.md","created_at":"2026-10-04T19:03:23+05:30","occurred_at":"2026-03-05T12:00:00Z","expires_at":null}`), &iso); err != nil {
+		t.Fatal(err)
+	}
+	if !iso.CreatedAt.Equal(written) || !iso.OccurredAt.Equal(m.OccurredAt) || !iso.ExpiresAt.IsZero() {
+		t.Errorf("iso = %+v", iso)
+	}
+
+	bare, err := c.Get(ctx, "facts/test/untagged.md", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bare.Tags != nil || bare.UserTags != nil || !bare.CreatedAt.Equal(written) || !bare.OccurredAt.IsZero() {
+		t.Errorf("untagged = %+v", bare)
 	}
 }

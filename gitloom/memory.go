@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -34,21 +36,113 @@ type Memory struct {
 	// within one response.
 	Score float64 `json:"score"`
 	// Matched names the arms that produced this memory: lexical, cue, body,
-	// graph. Matched only by graph means context that rode in beside a real
-	// match rather than evidence, and Via names what pulled it in.
+	// graph, and on the lane path time. Matched only by graph means context
+	// that rode in beside a real match rather than evidence, and Via names
+	// what pulled it in.
 	Matched  []string `json:"matched"`
 	Sections []string `json:"sections,omitempty"`
 	Via      []string `json:"via,omitempty"`
 
-	Tags       []string `json:"tags,omitempty"`
-	Created    string   `json:"created,omitempty"`
-	Updated    string   `json:"updated,omitempty"`
+	// Store, Said and Excerpted are set on the lane path: a curated "memory"
+	// or a word-for-word conversation "turn", the days it was stated oldest
+	// first, and whether Content was cut to fit MaxChars.
+	Store     string   `json:"store,omitempty"`
+	Said      []string `json:"said,omitempty"`
+	Excerpted bool     `json:"excerpted,omitempty"`
+
+	// Tags lists the caller's tags first, then the inferred ones; UserTags
+	// holds the caller's alone.
+	Tags     []string `json:"tags,omitempty"`
+	UserTags []string `json:"user_tags,omitempty"`
+
+	// The times travel as unix seconds and decode to UTC, zero when absent.
+	// OccurredAt is when the memory's subject happened, and OccurredSource how
+	// that is known: "user", "extracted", "said" or "written".
+	// OccurredPrecision "day" means only the date is known, held as noon UTC
+	// on it, so show OccurredAt.Format(time.DateOnly); otherwise "instant".
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	OccurredAt        time.Time `json:"occurred_at"`
+	ExpiresAt         time.Time `json:"expires_at"`
+	OccurredSource    string    `json:"occurred_source,omitempty"`
+	OccurredPrecision string    `json:"occurred_precision,omitempty"`
+
+	// Deprecated: use CreatedAt.
+	Created string `json:"created,omitempty"`
+	// Deprecated: use UpdatedAt.
+	Updated string `json:"updated,omitempty"`
+
 	Confidence float64  `json:"confidence,omitempty"`
 	Cues       []string `json:"cues,omitempty"`
 
 	Scores     *Scores     `json:"scores,omitempty"`
 	Related    []Relation  `json:"related,omitempty"`
 	Provenance *Provenance `json:"provenance,omitempty"`
+}
+
+type memoryFields Memory
+
+// memoryWire is Memory as the API sends it. Its times shadow Memory's.
+type memoryWire struct {
+	memoryFields
+	CreatedAt  wireTime `json:"created_at,omitzero"`
+	UpdatedAt  wireTime `json:"updated_at,omitzero"`
+	OccurredAt wireTime `json:"occurred_at,omitzero"`
+	ExpiresAt  wireTime `json:"expires_at,omitzero"`
+}
+
+func (m Memory) MarshalJSON() ([]byte, error) {
+	return json.Marshal(memoryWire{memoryFields(m),
+		wireTime(m.CreatedAt), wireTime(m.UpdatedAt), wireTime(m.OccurredAt), wireTime(m.ExpiresAt)})
+}
+
+func (m *Memory) UnmarshalJSON(b []byte) error {
+	var w memoryWire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	*m = Memory(w.memoryFields)
+	m.CreatedAt, m.UpdatedAt = time.Time(w.CreatedAt), time.Time(w.UpdatedAt)
+	m.OccurredAt, m.ExpiresAt = time.Time(w.OccurredAt), time.Time(w.ExpiresAt)
+	return nil
+}
+
+// wireTime is a memory time as the API sends it: unix seconds, or RFC 3339
+// under time_format=iso. It decodes to UTC and encodes as unix seconds.
+type wireTime time.Time
+
+func (w wireTime) IsZero() bool { return time.Time(w).IsZero() }
+
+func (w wireTime) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.FormatInt(time.Time(w).Unix(), 10)), nil
+}
+
+func (w *wireTime) UnmarshalJSON(b []byte) error {
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	switch v := v.(type) {
+	case nil:
+		*w = wireTime{}
+	case float64:
+		*w = wireTime{}
+		if s := int64(math.Floor(v)); s != 0 {
+			*w = wireTime(time.Unix(s, 0).UTC())
+		}
+	case string:
+		*w = wireTime{}
+		if v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				return fmt.Errorf("gitloom: time %q is not RFC 3339: %w", v, err)
+			}
+			*w = wireTime(t.UTC())
+		}
+	default:
+		return fmt.Errorf("gitloom: a time is unix seconds or RFC 3339, not %s", b)
+	}
+	return nil
 }
 
 type Scores struct {
@@ -105,12 +199,25 @@ type TraceEvent struct {
 }
 
 // Timings says where a retrieval spent its time. ModelMillis is set only when
-// a mode ran one.
+// a mode ran one; the rest after it only on the lane path.
 type Timings struct {
-	LexicalMillis int64 `json:"lexical_ms"`
-	VectorMillis  int64 `json:"vector_ms"`
-	GraphMillis   int64 `json:"graph_ms"`
-	ModelMillis   int64 `json:"model_ms,omitempty"`
+	LexicalMillis int64        `json:"lexical_ms"`
+	VectorMillis  int64        `json:"vector_ms"`
+	GraphMillis   int64        `json:"graph_ms"`
+	ModelMillis   int64        `json:"model_ms,omitempty"`
+	EmbedMillis   int64        `json:"embed_ms,omitempty"`
+	LanesMillis   int64        `json:"lanes_ms,omitempty"`
+	RankMillis    int64        `json:"rank_ms,omitempty"`
+	Lane          []LaneTiming `json:"lane,omitempty"`
+}
+
+// LaneTiming is one lane's search of one store.
+type LaneTiming struct {
+	Lane   string `json:"lane"`
+	Store  string `json:"store"`
+	Millis int64  `json:"ms"`
+	N      int    `json:"n"`
+	Err    string `json:"err,omitempty"`
 }
 
 // RecallResult is one retrieval's answer.
@@ -128,6 +235,11 @@ type RecallResult struct {
 	Trace     []TraceEvent `json:"trace,omitempty"`
 	Truncated bool         `json:"truncated,omitempty"`
 
+	// Rank is the lane ranking asked for. RankFallback means RankJev could
+	// not rank, so Memories are in lane order.
+	Rank         string `json:"rank,omitempty"`
+	RankFallback bool   `json:"rank_fallback,omitempty"`
+
 	// Candidates is how many distinct memories any arm produced before the
 	// relevance floor; FilteredOut how many that floor dropped. Many filtered
 	// out with no memories is an unanswerable question rather than a miss.
@@ -141,7 +253,16 @@ type RecallResult struct {
 type RememberOptions struct {
 	Namespace string
 	SessionID string
-	// Date the conversation happened, "2006-01-02". Empty means today.
+	// Tags are applied to every memory drawn from the conversation.
+	Tags []string
+	// OccurredAt is when the conversation happened. Zero means now.
+	OccurredAt When
+	// Timezone is the IANA zone the conversation happened in, e.g.
+	// "Asia/Kolkata". A time without an offset is read in it.
+	Timezone string
+	// Date the conversation happened, "2006-01-02".
+	//
+	// Deprecated: use OccurredAt, which wins when both are set.
 	Date string
 }
 
@@ -160,6 +281,15 @@ func (c *Client) Remember(ctx context.Context, turns []Turn, opts *RememberOptio
 	if o.SessionID != "" {
 		body["session_id"] = o.SessionID
 	}
+	if len(o.Tags) > 0 {
+		body["tags"] = o.Tags
+	}
+	if !o.OccurredAt.IsZero() {
+		body["occurred_at"] = o.OccurredAt
+	}
+	if o.Timezone != "" {
+		body["timezone"] = o.Timezone
+	}
 	if o.Date != "" {
 		body["date"] = o.Date
 	}
@@ -172,6 +302,25 @@ const (
 	ModeRaw     = "raw"
 	ModeSummary = "summary"
 	ModeAgentic = "agentic"
+)
+
+// Lane-path rankings: by lane score, or with a ranking model.
+const (
+	RankFused = "fused"
+	RankJev   = "jev"
+)
+
+// Models that can read the memories in ModeSummary or ModeAgentic.
+const (
+	ModelHaiku  = "haiku"
+	ModelSonnet = "sonnet"
+)
+
+// The memory times a Since/Until range can bound, for RecallOptions.TimeField.
+const (
+	TimeOccurred = "occurred"
+	TimeCreated  = "created"
+	TimeUpdated  = "updated"
 )
 
 // RecallOptions shape one retrieval.
@@ -190,6 +339,15 @@ type RecallOptions struct {
 	TagsAll []string // every one of these
 	Since   time.Time
 	Until   time.Time
+	// TimeField picks the time Since and Until bound, and orders a listing:
+	// TimeOccurred, TimeCreated, or TimeUpdated (the server's default).
+	TimeField string
+	// TZ is the IANA zone, e.g. "Asia/Kolkata", the server reads offset-less
+	// times and bare dates in when since and until arrive as text. Since and
+	// Until go as UTC instants, so TZ never changes the range; it is sent for
+	// parity, and is otherwise read only where the server reads question dates
+	// by zone.
+	TZ string
 
 	// MinScore drops memories below this relevance. NoContext drops graph
 	// neighbours, leaving only what matched the query directly.
@@ -210,6 +368,13 @@ type RecallOptions struct {
 	// NoRelations drops each memory's neighbours and their snippets. Cheap to
 	// leave on; this exists for bulk scans that only want the text.
 	NoRelations bool
+
+	// Rank retrieves on the lane path, which also reaches conversation turns
+	// and the dates in a question. Not with ModeAgentic. MaxChars caps the
+	// memory content returned; Model picks the reader.
+	Rank     string
+	MaxChars int
+	Model    string
 }
 
 func (o RecallOptions) query(fallbackNamespace string) url.Values {
@@ -237,6 +402,12 @@ func (o RecallOptions) query(fallbackNamespace string) url.Values {
 	if !o.Until.IsZero() {
 		q.Set("until", o.Until.UTC().Format(time.RFC3339))
 	}
+	if o.TimeField != "" {
+		q.Set("time_field", o.TimeField)
+	}
+	if o.TZ != "" {
+		q.Set("tz", o.TZ)
+	}
 	if o.MinScore > 0 {
 		q.Set("min_score", strconv.FormatFloat(o.MinScore, 'g', -1, 64))
 	}
@@ -255,23 +426,49 @@ func (o RecallOptions) query(fallbackNamespace string) url.Values {
 	if o.NoRelations {
 		q.Set("no_relations", "1")
 	}
+	if o.Rank != "" {
+		q.Set("rank", o.Rank)
+	}
+	if o.MaxChars > 0 {
+		q.Set("max_chars", strconv.Itoa(o.MaxChars))
+	}
+	if o.Model != "" {
+		q.Set("model", o.Model)
+	}
 	return q
 }
 
 // Recall retrieves what is known that bears on the query.
+//
+// With an empty query and at least one filter (Tags, TagsAll, Since, Until,
+// Tiers or Paths), it lists every memory the filters match instead, newest
+// first by TimeField, each scored 1; Mode must then be raw and Rank unset.
+// With neither it returns ErrNoQuery without calling the API.
 func (c *Client) Recall(ctx context.Context, query string, opts *RecallOptions) (*RecallResult, error) {
 	o := RecallOptions{}
 	if opts != nil {
 		o = *opts
 	}
 	q := o.query(c.namespace)
-	q.Set("q", query)
+	if strings.TrimSpace(query) != "" {
+		q.Set("q", query)
+	} else if !o.filtered() {
+		return nil, ErrNoQuery
+	}
 	var out RecallResult
 	if err := c.request(ctx, "GET", "/v1/retrieve?"+q.Encode(), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
+
+func (o RecallOptions) filtered() bool {
+	return len(o.Tags) > 0 || len(o.TagsAll) > 0 || !o.Since.IsZero() || !o.Until.IsZero() ||
+		len(o.Tiers) > 0 || len(o.Paths) > 0
+}
+
+// ErrNoQuery means Recall was given neither a query nor a filter to list by.
+var ErrNoQuery = errors.New("gitloom: Recall needs a query, or a filter (Tags, TagsAll, Since, Until, Tiers or Paths) to list by")
 
 // ErrNoAnswer means a model-backed mode returned no text.
 var ErrNoAnswer = errors.New("gitloom: the model did not produce an answer")
