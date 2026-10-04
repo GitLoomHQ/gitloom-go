@@ -253,6 +253,46 @@ known: `user` (you said), `extracted` (the memory names the day), `said` (when
 its conversation happened) or `written`. The `Created` and `Updated` strings
 are deprecated.
 
+## Errors
+
+```go
+_, err := mem.Recall(ctx, "what camera do I own", nil)
+
+var apiErr *gitloom.APIError
+var netErr *url.Error
+switch {
+case errors.As(err, &apiErr) && apiErr.Status == http.StatusTooManyRequests:
+    fmt.Println("slow down for", apiErr.RetryAfter)   // zero when the server sent no Retry-After
+case errors.As(err, &apiErr):
+    fmt.Println(apiErr.Status, apiErr.Code, apiErr.Message)
+case errors.Is(err, context.DeadlineExceeded):
+    fmt.Println("timed out:", err)                    // your context's deadline, or the client's timeout
+case errors.Is(err, context.Canceled):
+    fmt.Println("canceled:", err)
+case errors.As(err, &netErr):
+    fmt.Println("network error:", err)                // DNS, refused connection, reset …
+}
+```
+
+A refusal is an `*APIError`. Its `Code` is the API's own (`invalid_tag`,
+`quota_exceeded`, `rate_limited` …), or `unauthorized` when the gateway refused
+the key, or `http_<status>` for any other error that carried no code. Nothing
+is retried for you; a 429 carries the server's `RetryAfter`.
+
+`New` cannot fail, so a missing or malformed key is reported by the first
+request, and every one after, before anything is sent, with `Status` 0. The
+key is trimmed first:
+`missing_api_key` means there was none, from `New` or `GITLOOM_API_KEY`, and
+`invalid_api_key` that it held whitespace or control characters.
+
+A network failure is not an `*APIError`. The cause stays wrapped and the
+message starts `gitloom: timed out:`, `gitloom: canceled:` or
+`gitloom: network error:`, so detect a timeout with
+`errors.Is(err, context.DeadlineExceeded)`, a cancellation with
+`errors.Is(err, context.Canceled)`, and anything else with `*url.Error` (or
+`net.Error`). `ErrNoQuery` and `ErrNoAnswer` are returned as they are, and no
+error ever holds the API key.
+
 ## Docs
 
 https://docs.gitloom.cloud/documentation/go
