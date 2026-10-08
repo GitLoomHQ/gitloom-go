@@ -24,6 +24,7 @@ type fakeAPI struct {
 	mu              sync.Mutex
 	messages        []map[string]any
 	compactions     []map[string]any
+	onCompact       func()
 	uploads         []string // content types, in order
 	title           string
 	nextSeq         int64
@@ -115,6 +116,9 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 		send(map[string]any{"next_seq": f.nextSeq, "written": len(msgs)})
 	case strings.HasSuffix(p, "/compact"):
 		f.compactions = append(f.compactions, body)
+		if f.onCompact != nil {
+			f.onCompact()
+		}
 		send(map[string]any{"compacted": true, "summary": "server summary"})
 	case strings.HasSuffix(p, "/edit"):
 		seq := int64(body["seq"].(float64))
@@ -1097,5 +1101,25 @@ func TestSkillsStoreAndFind(t *testing.T) {
 	}
 	if f.skillQueries[1].Get("q") != "" {
 		t.Error("listing must not send a query")
+	}
+}
+
+// A history that shrank while the compact request was in flight must not
+// panic the slice that drops the evicted turns.
+func TestCompactClampsWhenHistoryShrank(t *testing.T) {
+	api, client := newFakeAPI(t)
+	conv, err := client.NewConversation(t.Context(), "c1", ConversationOptions{
+		Model: "claude-sonnet-5", SummarizeServer: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.history = make([]models.AIMessage, 6)
+	api.onCompact = func() { conv.history = conv.history[:1] }
+	if _, err := conv.Compact(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(conv.history) != 0 {
+		t.Fatalf("history = %d, want 0", len(conv.history))
 	}
 }

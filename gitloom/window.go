@@ -110,7 +110,7 @@ func (conv *Conversation) Compact(ctx context.Context) (string, error) {
 	} else {
 		conv.summary = summary
 	}
-	conv.history = conv.history[len(evicted):]
+	conv.history = conv.history[min(len(evicted), len(conv.history)):]
 	conv.firstLiveSeq = to + 1
 	conv.exchanges = 0
 	conv.reportedTokens = 0
@@ -149,7 +149,7 @@ func (conv *Conversation) compactOnServer(ctx context.Context) (string, error) {
 	} else {
 		conv.summary = res.Summary
 	}
-	conv.history = conv.history[len(evicted):]
+	conv.history = conv.history[min(len(evicted), len(conv.history)):]
 	conv.firstLiveSeq = to + 1
 	conv.exchanges = 0
 	conv.reportedTokens = 0
