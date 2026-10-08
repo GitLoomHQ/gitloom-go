@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.1 — 2026-10-08
+
+### Fixed
+
+- **`Compact` no longer panics on a history that shrank mid-request.**
+  Dropping the evicted turns sliced `history[len(evicted):]`, which panicked
+  with `slice bounds out of range` when the live history had become shorter
+  than the evicted slice while the compact request was in flight (seen with
+  concurrent `Append` on one `*Conversation`). Both the client-side and the
+  server-side compaction now clamp the slice to the live history.
+
 ## v0.6.0 — 2026-10-04
 
 ### Breaking
